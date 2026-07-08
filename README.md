@@ -84,7 +84,7 @@ At the end, it prints how many rows were targeted, updated, or unresolved.
 
 ---
 
-## 5. Choose Download Targets
+## 5. Choose Download Targets (optional)
 
 By default, the downloader will try to download PDFs for all rows with a DOI.
 
@@ -207,7 +207,7 @@ browser/{pmid}.pdf
 
 ---
 
-## 9. Batch Settings
+## 9. Batch Settings (optional)
 
 You can adjust these constants near the top of `download_browser_pdfs.py`:
 
@@ -254,3 +254,8 @@ Avoid downloading unrelated files while the script is running. The script moves 
 ### Clear cache
 
 For Elsevier / ScienceDirect, if a download error occurs, it may be because the site detects abnormal or repeated downloading behavior. In that case, try clearing your browser cache from time to time. I use a Chrome extension called “Clear Cache” for this.
+
+---
+
+## 11. Manual Download
+If some files are skipped after running the code, you can try finding them manually through OSU Library or https://www.sci-hub.ru/ using DOI in metadata.
