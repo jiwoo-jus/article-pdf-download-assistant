@@ -255,6 +255,15 @@ def completed_files(directory: Path) -> list[Path]:
 def read_skip_nonblocking() -> bool:
     if not sys.stdin.isatty():
         return False
+
+    if os.name == "nt":
+        # On Windows, select() only accepts sockets, not console input.
+        import msvcrt
+
+        if not msvcrt.kbhit():
+            return False
+        return msvcrt.getwch().lower() == "s"
+
     ready, _, _ = select.select([sys.stdin], [], [], 0)
     if not ready:
         return False
@@ -398,7 +407,8 @@ def main() -> int:
             continue
 
         while True:
-            hint = "| press 's' + Enter to skip" if INTERACTIVE_SKIP else ""
+            skip_keys = "'s'" if os.name == "nt" else "'s' + Enter"
+            hint = f"| press {skip_keys} to skip" if INTERACTIVE_SKIP else ""
             print(f"  [WAIT] {WAIT_TIMEOUT_SECONDS}s {hint}".rstrip())
             new_file, skipped = wait_for_download(known)
 

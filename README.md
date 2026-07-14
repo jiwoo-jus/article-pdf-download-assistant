@@ -170,7 +170,8 @@ During each record, the terminal will show:
 [WAIT] 600s | press 's' + Enter to skip
 ```
 
-Press `s` and Enter to skip the current record.
+On Windows, press `s` to skip the current record. On macOS and Linux, press
+`s` and Enter.
 
 If no file is detected before the timeout, the script will let you retry or skip.
 
