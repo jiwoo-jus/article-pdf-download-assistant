@@ -108,6 +108,21 @@ DRY_RUN = False
 OPEN_COMMAND: str | None = None
 BATCH_LOG_PATH: Path | None = None
 BLOCKED_URL_PATTERNS = ["karger.com"]
+AUTOMATE_PUBLISHER_PDF_CLICK = True
+PUBLISHER_CLICK_TIMEOUT_SECONDS = 30
+
+SCIENCEDIRECT_PROXY_HOST = "www-sciencedirect-com.proxy.lib.ohio-state.edu"
+SCIENCEDIRECT_ARTICLE_BASE_URL = (
+    f"https://{SCIENCEDIRECT_PROXY_HOST}/science/article/pii"
+)
+ACS_PROXY_HOST = "pubs-acs-org.proxy.lib.ohio-state.edu"
+ACS_ARTICLE_BASE_URL = f"https://{ACS_PROXY_HOST}/doi/full"
+WILEY_PROXY_HOST = (
+    "analyticalsciencejournals-onlinelibrary-wiley-com.proxy.lib.ohio-state.edu"
+)
+WILEY_ARTICLE_BASE_URL = f"https://{WILEY_PROXY_HOST}/doi/full"
+SAGE_PROXY_HOST = "journals-sagepub-com.proxy.lib.ohio-state.edu"
+SAGE_ARTICLE_BASE_URL = f"https://{SAGE_PROXY_HOST}/doi/full"
 
 TEMP_SUFFIXES = {".crdownload", ".part", ".download", ".tmp"}
 
@@ -115,23 +130,35 @@ DOI_PREFIX_RULES: list[tuple[str, str]] = [
     ("10.3390/", "https://www.mdpi.com/article/{doi}/pdf"),
     ("10.1007/", "https://link.springer.com/content/pdf/{doi}.pdf"),
     ("10.1038/", "https://link.springer.com/content/pdf/{doi}.pdf"),
-    ("10.1002/", "https://onlinelibrary.wiley.com/doi/pdfdirect/{doi}"),
-    ("10.1111/", "https://onlinelibrary.wiley.com/doi/pdfdirect/{doi}"),
-    ("10.1096/", "https://faseb.onlinelibrary.wiley.com/doi/pdfdirect/{doi}"),
-    ("10.1021/", "https://pubs.acs.org/doi/abs/{doi}"),
+    ("10.1002/", f"{WILEY_ARTICLE_BASE_URL}/{{doi}}"),
+    ("10.1111/", f"{WILEY_ARTICLE_BASE_URL}/{{doi}}"),
+    ("10.1096/", f"{WILEY_ARTICLE_BASE_URL}/{{doi}}"),
+    ("10.1021/", f"{ACS_ARTICLE_BASE_URL}/{{doi}}"),
     ("10.3389/", "https://www.frontiersin.org/articles/{doi}/pdf"),
     ("10.1073/", "https://www.pnas.org/doi/pdf/{doi}"),
     ("10.1126/", "https://www.science.org/doi/pdf/{doi}"),
     ("10.1128/", "https://journals.asm.org/doi/pdf/{doi}"),
-    ("10.1177/", "https://journals.sagepub.com/doi/abs/{doi}"),
+    ("10.1177/", f"{SAGE_ARTICLE_BASE_URL}/{{doi}}"),
+    ("10.1089/", f"{SAGE_ARTICLE_BASE_URL}/{{doi}}"),
 ]
 
 
 def strip_doi_path_slug(after_doi: str) -> str:
-    for slug in ("abs/", "full/", "pdf/", "pdfdirect/", "epdf/"):
+    for slug in ("abs/", "full/", "pdf/", "pdfdirect/", "epdf/", "epub/", "reader/"):
         if after_doi.startswith(slug):
             return after_doi[len(slug):]
     return after_doi
+
+
+def is_wiley_host(host: str) -> bool:
+    return (
+        host.endswith("onlinelibrary.wiley.com")
+        or host.endswith("onlinelibrary-wiley-com.proxy.lib.ohio-state.edu")
+    )
+
+
+def is_sage_host(host: str) -> bool:
+    return host == "journals.sagepub.com" or host == SAGE_PROXY_HOST
 
 
 def rewrite_resolved_url(url: str) -> str:
@@ -139,15 +166,15 @@ def rewrite_resolved_url(url: str) -> str:
     host = parsed.netloc.lower()
     path = parsed.path
 
-    if "onlinelibrary.wiley.com" in host and "/doi/" in path:
+    if is_wiley_host(host) and "/doi/" in path:
         after = strip_doi_path_slug(path.split("/doi/", 1)[1])
         if after.startswith("10."):
-            return f"https://{host}/doi/pdfdirect/{after.split('?')[0]}"
+            return f"{WILEY_ARTICLE_BASE_URL}/{after.split('?')[0]}"
 
-    if host == "pubs.acs.org" and "/doi/" in path:
+    if host in ("pubs.acs.org", ACS_PROXY_HOST) and "/doi/" in path:
         after = strip_doi_path_slug(path.split("/doi/", 1)[1])
         if after.startswith("10."):
-            return f"https://pubs.acs.org/doi/abs/{after.split('?')[0]}"
+            return f"{ACS_ARTICLE_BASE_URL}/{after.split('?')[0]}"
 
     if host.endswith("frontiersin.org"):
         if path.endswith("/full"):
@@ -175,19 +202,19 @@ def rewrite_resolved_url(url: str) -> str:
         after = strip_doi_path_slug(path.split("/doi/", 1)[1])
         return f"https://journals.asm.org/doi/pdf/{after.split('?')[0]}"
 
-    if host == "journals.sagepub.com" and "/doi/" in path:
+    if is_sage_host(host) and "/doi/" in path:
         after = strip_doi_path_slug(path.split("/doi/", 1)[1])
-        return f"https://journals.sagepub.com/doi/pdf/{after.split('?')[0]}"
+        return f"{SAGE_ARTICLE_BASE_URL}/{after.split('?')[0]}"
 
     if host == "linkinghub.elsevier.com" and "/retrieve/pii/" in path:
         pii = path.split("/retrieve/pii/")[-1].strip("/").split("?")[0]
         if pii:
-            return f"https://www.sciencedirect.com/science/article/pii/{pii}"
+            return f"{SCIENCEDIRECT_ARTICLE_BASE_URL}/{pii}"
 
     if host.endswith("sciencedirect.com") and "/article/pii/" in path:
         pii = path.split("/article/pii/")[-1].strip("/").split("?")[0]
         if pii:
-            return f"https://www.sciencedirect.com/science/article/pii/{pii}"
+            return f"{SCIENCEDIRECT_ARTICLE_BASE_URL}/{pii}"
 
     if host.endswith("link.springer.com"):
         if path.startswith("/content/pdf/") and path.endswith(".pdf"):
@@ -205,7 +232,7 @@ def resolve_best_pdf_url(doi: str, resolve_timeout: float = 8.0) -> str:
     if not doi:
         return ""
     if doi.startswith("http"):
-        return doi
+        return rewrite_resolved_url(doi)
     if doi.startswith("10.7554/eLife."):
         article_id = doi.split("eLife.")[-1]
         return f"https://elifesciences.org/articles/{article_id}.pdf"
@@ -296,11 +323,158 @@ def log_event(payload: dict) -> None:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+def publisher_pdf_click_rule(url: str) -> tuple[str, str, str | None] | None:
+    host = urlparse(url).netloc.lower().split(":", 1)[0]
+    if host.endswith("sciencedirect.com") or host == SCIENCEDIRECT_PROXY_HOST:
+        return (
+            "ScienceDirect",
+            'a[aria-label^="View PDF"][href*="/pdfft"], a[href*="/pdfft"]',
+            None,
+        )
+    if host in ("pubs.acs.org", ACS_PROXY_HOST):
+        return (
+            "ACS",
+            'a[data-id="article_header_OpenPDF"][href*="/doi/pdf/"], '
+            'a.article__btn__secondary--pdf[href*="/doi/pdf/"]',
+            None,
+        )
+    if is_wiley_host(host):
+        return (
+            "Wiley",
+            'a.pdf-download[href*="/doi/epdf/"], '
+            'a[title="ePDF"][href*="/doi/epdf/"]',
+            'a.navbar-download[href*="/doi/pdfdirect/"][data-single-download="true"], '
+            'a.navbar-download[href*="/doi/pdfdirect/"], '
+            'div.navbar-download a.download[data-download-files-key="pdf"]'
+            '[href*="/doi/pdfdirect/"], '
+            'a.download[data-download-files-key="pdf"][href*="/doi/pdfdirect/"]',
+        )
+    if is_sage_host(host):
+        return (
+            "SAGE",
+            'a[data-id="article-toolbar-pdf-epub"][href*="/doi/reader/"], '
+            'a[href*="/doi/reader/"]',
+            'a#favourite-download[href*="/doi/pdf/"], '
+            'a[aria-label="Download PDF"][href*="/doi/pdf/"]',
+        )
+    return None
+
+
+def open_publisher_and_click_pdf(
+    url: str,
+    publisher: str,
+    selector: str,
+    download_selector: str | None,
+) -> bool:
+    """Open a publisher article and click through to its final PDF download."""
+    if sys.platform != "darwin" or not shutil.which("osascript"):
+        return False
+
+    attempts = max(1, int(PUBLISHER_CLICK_TIMEOUT_SECONDS / 0.5))
+    javascript = """
+(() => {
+  const downloadSelector = __DOWNLOAD_SELECTOR__;
+  if (downloadSelector) {
+    const downloadLink = document.querySelector(downloadSelector);
+    if (downloadLink) {
+      downloadLink.target = '_self';
+      downloadLink.click();
+      return 'download_clicked';
+    }
+  }
+
+  const link = document.querySelector(__PDF_SELECTOR__);
+  if (!link) return 'waiting';
+  if (link.dataset.automatedPdfClick === 'true') return 'waiting';
+  link.dataset.automatedPdfClick = 'true';
+  link.target = '_self';
+  link.click();
+  return downloadSelector ? 'pdf_page_opened' : 'download_clicked';
+})()
+""".replace(
+        "__DOWNLOAD_SELECTOR__", json.dumps(download_selector)
+    ).replace(
+        "__PDF_SELECTOR__", json.dumps(selector)
+    ).strip()
+    apple_script = f"""
+on run argv
+    set targetUrl to item 1 of argv
+    set clickScript to item 2 of argv
+
+    tell application "Google Chrome"
+        if (count of windows) is 0 then make new window
+        set articleTab to make new tab at end of tabs of front window with properties {{URL:targetUrl}}
+        set active tab index of front window to (count of tabs of front window)
+        set pdfPageOpened to false
+        set lastJavaScriptError to ""
+
+        repeat {attempts} times
+            delay 0.5
+            try
+                set clickResult to execute articleTab javascript clickScript
+                if clickResult is "download_clicked" then return "download_clicked"
+                if clickResult is "pdf_page_opened" then set pdfPageOpened to true
+            on error errorMessage
+                set lastJavaScriptError to errorMessage
+            end try
+        end repeat
+
+        if pdfPageOpened then return "download_link_not_found"
+        if lastJavaScriptError is not "" then return "javascript_error: " & lastJavaScriptError
+        return "view_pdf_not_found"
+    end tell
+end run
+"""
+
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", apple_script, url, javascript],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        print(f"  [AUTO-PDF] Chrome automation unavailable: {exc}")
+        return False
+
+    status = result.stdout.strip()
+    if status == "download_clicked":
+        print(f"  [AUTO-PDF] clicked {publisher} PDF download")
+        return True
+
+    if status.startswith("javascript_error:"):
+        print("  [AUTO-PDF] article opened, but Chrome blocked the automatic click")
+        print("  [AUTO-PDF] enable View > Developer > Allow JavaScript from Apple Events")
+        return True
+
+    if status == "view_pdf_not_found":
+        print(f"  [AUTO-PDF] {publisher} PDF link was not found; article left open")
+        return True
+
+    if status == "download_link_not_found":
+        print(f"  [AUTO-PDF] {publisher} PDF opened, but its download link was not found")
+        return True
+
+    error = result.stderr.strip() or status or f"osascript exited {result.returncode}"
+    print(f"  [AUTO-PDF] Chrome automation failed: {error}")
+    return False
+
+
 def open_url(url: str) -> None:
     if OPEN_COMMAND:
         subprocess.run([*shlex.split(OPEN_COMMAND), url], check=False)
-    else:
-        webbrowser.open_new_tab(url)
+        return
+
+    if AUTOMATE_PUBLISHER_PDF_CLICK:
+        click_rule = publisher_pdf_click_rule(url)
+        if click_rule:
+            publisher, selector, download_selector = click_rule
+            if open_publisher_and_click_pdf(
+                url, publisher, selector, download_selector
+            ):
+                return
+
+    webbrowser.open_new_tab(url)
 
 
 def existing_pdf_path(pmid: str) -> Path | None:
