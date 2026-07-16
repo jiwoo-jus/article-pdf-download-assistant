@@ -1,10 +1,16 @@
 '''
-Implemented the “tier” concept.
-Tier 1 processes verified publisher rules and direct PDF URLs first.
-Tier 2 handles EBSCO, and unknown publishers manually.
-Preserves original CSV order within each publisher group.
-Displays automatic/manual counts and the mode for every record.
-Prevents AppleScript automation on manual-only pages.
+At every configured cleanup interval—currently every 3 successful downloads—the script will Clear disk and code caches. 
+
+After each new PDF, the terminal shows:
+[CLEANUP COUNTDOWN] 1 successful PDF(s); next cache/cookie cleanup in 2 successful PDF(s).
+
+At the current interval of 3:
+[CLEANUP START] 3 successful PDFs reached.
+[CACHE CLEAR] Removed ... Chrome cache entries.
+[COOKIE CLEAR] Removed ... cookie database file(s).
+[CLEANUP COMPLETE] CHROME CACHE AND COOKIES WERE CLEARED.
+
+Warnings are displayed prominently if any part fails.
 '''
 
 from __future__ import annotations
@@ -172,8 +178,32 @@ OPEN_COMMAND: str | None = None
 BATCH_LOG_PATH: Path | None = None
 # Matching URLs are recorded as skipped instead of silently disappearing.
 BLOCKED_URL_PATTERNS = ["karger.com"]
+# Matching URLs remain in the queue but run in the manual-review tier.
+MANUAL_URL_PATTERNS = ["link.springer.com"]
 AUTOMATE_PUBLISHER_PDF_CLICK = True
-PUBLISHER_CLICK_TIMEOUT_SECONDS = 30
+PUBLISHER_CLICK_TIMEOUT_SECONDS = 20
+AUTO_CLEAR_BROWSER_CACHE = True
+CACHE_CLEAR_EVERY_FILES = 3
+CLEAR_COOKIES_WITH_CACHE = True
+CHROME_PROFILE_DIRECTORY = "Default"
+CHROME_CACHE_ROOT = Path.home() / "Library" / "Caches" / "Google" / "Chrome"
+CHROME_USER_DATA_ROOT = (
+    Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
+)
+CHROME_CACHE_DIRECTORIES = (
+    CHROME_CACHE_ROOT / CHROME_PROFILE_DIRECTORY / "Cache",
+    CHROME_CACHE_ROOT / CHROME_PROFILE_DIRECTORY / "Code Cache",
+)
+CHROME_PROFILE_ROOT = CHROME_USER_DATA_ROOT / CHROME_PROFILE_DIRECTORY
+CHROME_COOKIE_DATABASES = (
+    CHROME_PROFILE_ROOT / "Cookies",
+    CHROME_PROFILE_ROOT / "Network" / "Cookies",
+)
+CHROME_COOKIE_FILES = tuple(
+    Path(f"{database}{suffix}")
+    for database in CHROME_COOKIE_DATABASES
+    for suffix in ("", "-journal", "-wal", "-shm")
+)
 
 # Lower values run first. Python's stable sort preserves CSV order within each
 # publisher group, while all verified automatic routes stay ahead of records
@@ -405,8 +435,18 @@ def resolve_best_pdf_url(doi: str, resolve_timeout: float = 8.0) -> str:
 
 
 def matching_blocked_pattern(url: str) -> str:
-    lowered = url.lower()
+    lowered = url.casefold()
     for pattern in BLOCKED_URL_PATTERNS:
+        cleaned = pattern.strip()
+        if cleaned and cleaned.casefold() in lowered:
+            return cleaned
+    return ""
+
+
+def matching_manual_pattern(url: str) -> str:
+    """Return the configured pattern that forces a URL into manual review."""
+    lowered = url.casefold()
+    for pattern in MANUAL_URL_PATTERNS:
         cleaned = pattern.strip()
         if cleaned and cleaned.casefold() in lowered:
             return cleaned
@@ -512,6 +552,214 @@ def log_event(payload: Mapping[str, object]) -> None:
     BATCH_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with BATCH_LOG_PATH.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def chrome_is_running() -> bool:
+    if sys.platform != "darwin" or not shutil.which("pgrep"):
+        return False
+    result = subprocess.run(
+        ["pgrep", "-x", "Google Chrome"],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def stop_chrome_for_cookie_cleanup(timeout_seconds: float = 15.0) -> tuple[bool, bool]:
+    """Quit Chrome so its cookie database can be removed safely."""
+    if sys.platform != "darwin" or not shutil.which("osascript"):
+        print("  [COOKIES] automatic Chrome restart is only supported on macOS")
+        return False, False
+
+    was_running = chrome_is_running()
+    if not was_running:
+        return True, False
+
+    result = subprocess.run(
+        ["osascript", "-e", 'tell application "Google Chrome" to quit'],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        error = result.stderr.strip() or f"osascript exited {result.returncode}"
+        print(f"  [COOKIES] unable to quit Chrome: {error}")
+        return False, True
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if not chrome_is_running():
+            print("  [COOKIES] Chrome closed for cookie cleanup")
+            return True, True
+        time.sleep(0.25)
+
+    print("  [COOKIES] Chrome did not close; cookie cleanup was skipped")
+    return False, True
+
+
+def reopen_chrome() -> bool:
+    """Reopen Chrome after deleting its cookie database."""
+    if sys.platform != "darwin" or not shutil.which("open"):
+        return False
+    result = subprocess.run(
+        ["open", "-a", "Google Chrome"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        print("  [COOKIES] Chrome reopened; browser logins must be completed again")
+        return True
+    error = result.stderr.strip() or f"open exited {result.returncode}"
+    print(f"  [COOKIES] unable to reopen Chrome: {error}")
+    return False
+
+
+def clear_browser_cache() -> bool:
+    """Clear Chrome disk caches and, when enabled, its cookie database."""
+    found_directory = False
+    removed_entries = 0
+    removed_cookie_files = 0
+    errors: list[str] = []
+
+    chrome_stopped = True
+    chrome_was_running = False
+    if CLEAR_COOKIES_WITH_CACHE:
+        chrome_stopped, chrome_was_running = stop_chrome_for_cookie_cleanup()
+        if not chrome_stopped:
+            errors.append("Chrome could not be stopped; cookies were not cleared")
+
+    for cache_directory in CHROME_CACHE_DIRECTORIES:
+        try:
+            entries = list(cache_directory.iterdir())
+            found_directory = True
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            errors.append(f"{cache_directory}: {exc}")
+            continue
+
+        for entry in entries:
+            try:
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry)
+                else:
+                    entry.unlink()
+                removed_entries += 1
+            except FileNotFoundError:
+                # Chrome may replace cache entries while cleanup is running.
+                continue
+            except OSError as exc:
+                errors.append(f"{entry}: {exc}")
+
+    if CLEAR_COOKIES_WITH_CACHE and chrome_stopped:
+        for cookie_file in CHROME_COOKIE_FILES:
+            try:
+                cookie_file.unlink()
+                removed_cookie_files += 1
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                errors.append(f"{cookie_file}: {exc}")
+
+    if chrome_was_running and chrome_stopped and not reopen_chrome():
+        errors.append("Chrome could not be reopened after cookie cleanup")
+
+    cleared_at = now_timestamp()
+    if not found_directory:
+        print(
+            "  [CACHE CLEAR] No Chrome cache directories found for profile "
+            f"{CHROME_PROFILE_DIRECTORY!r}.",
+            flush=True,
+        )
+    else:
+        print(
+            f"  [CACHE CLEAR] Removed {removed_entries} Chrome cache "
+            "entry/entries.",
+            flush=True,
+        )
+
+    if CLEAR_COOKIES_WITH_CACHE:
+        if not chrome_stopped:
+            print("  [COOKIE CLEAR] SKIPPED because Chrome did not close.", flush=True)
+        elif removed_cookie_files:
+            print(
+                f"  [COOKIE CLEAR] Removed {removed_cookie_files} cookie "
+                "database file(s).",
+                flush=True,
+            )
+        else:
+            print(
+                "  [COOKIE CLEAR] No cookie database files were present; "
+                "cookies were already clear.",
+                flush=True,
+            )
+
+    if errors:
+        print(
+            f"  [CLEANUP WARNING] Finished with {len(errors)} error(s).",
+            flush=True,
+        )
+        for error in errors[:3]:
+            print(f"  [CLEANUP WARNING] {error}", flush=True)
+
+    log_event(
+        {
+            "event": "browser_cache_cleared",
+            "profile": CHROME_PROFILE_DIRECTORY,
+            "removed_entries": removed_entries,
+            "removed_cookie_files": removed_cookie_files,
+            "errors": errors,
+            "finished_at": cleared_at,
+        }
+    )
+    return not errors
+
+
+def maybe_clear_browser_cache(successful_downloads: int) -> bool:
+    """Clear cache at each configured successful-download interval."""
+    if not AUTO_CLEAR_BROWSER_CACHE or CACHE_CLEAR_EVERY_FILES <= 0:
+        return False
+    if successful_downloads <= 0:
+        return False
+
+    completed_in_cycle = successful_downloads % CACHE_CLEAR_EVERY_FILES
+    if completed_in_cycle:
+        remaining = CACHE_CLEAR_EVERY_FILES - completed_in_cycle
+        print(
+            f"  [CLEANUP COUNTDOWN] {successful_downloads} successful PDF(s); "
+            f"next cache/cookie cleanup in {remaining} successful PDF(s).",
+            flush=True,
+        )
+        return False
+
+    print(
+        "\n============================================================\n"
+        f"[CLEANUP START] {successful_downloads} successful PDFs reached.\n"
+        "Clearing Chrome cache and cookies now...\n"
+        "============================================================",
+        flush=True,
+    )
+    cleared = clear_browser_cache()
+    if cleared:
+        print(
+            "============================================================\n"
+            "[CLEANUP COMPLETE] CHROME CACHE AND COOKIES WERE CLEARED.\n"
+            "Chrome was reopened; sign in again if required.\n"
+            "============================================================\n",
+            flush=True,
+        )
+    else:
+        print(
+            "============================================================\n"
+            "[CLEANUP WARNING] CLEANUP DID NOT FULLY COMPLETE.\n"
+            "Review the warning messages above.\n"
+            "============================================================\n",
+            flush=True,
+        )
+    return cleared
 
 
 def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
@@ -640,6 +888,14 @@ def download_strategy(url: str) -> DownloadStrategy:
     parsed = urlparse(url)
     host = (parsed.hostname or "").casefold()
     path = parsed.path.casefold()
+
+    manual_pattern = matching_manual_pattern(url)
+    if manual_pattern:
+        return DownloadStrategy(
+            priority=MANUAL_REVIEW_PRIORITY,
+            automatic=False,
+            label=f"configured manual pattern: {manual_pattern}",
+        )
 
     # These viewers use opaque, session-dependent controls. Keep them visible
     # for a human instead of attempting an unsafe speculative click.
@@ -965,6 +1221,9 @@ def main() -> int:
     if WAIT_TIMEOUT_SECONDS <= 0 or POLL_INTERVAL_SECONDS <= 0:
         print("Download timeout and polling interval must be positive")
         return 1
+    if AUTO_CLEAR_BROWSER_CACHE and CACHE_CLEAR_EVERY_FILES <= 0:
+        print("CACHE_CLEAR_EVERY_FILES must be > 0 when cache cleanup is enabled")
+        return 1
     if not INPUT_CSV.exists():
         print(f"Input CSV not found: {INPUT_CSV}")
         return 1
@@ -1011,6 +1270,14 @@ def main() -> int:
     )
     print(f"[WATCH] {WATCH_DIR}")
     print(f"[OUT]   {OUTPUT_DIR}")
+    if AUTO_CLEAR_BROWSER_CACHE:
+        print(
+            f"[CLEANUP SCHEDULE] Cache and cookies clear after every "
+            f"{CACHE_CLEAR_EVERY_FILES} successful new PDFs "
+            f"(Chrome profile: {CHROME_PROFILE_DIRECTORY})."
+        )
+
+    successful_downloads = 0
 
     for position, row in enumerate(queue, start=1):
         pmid = normalize_pmid(row.get(PMID_COLUMN))
@@ -1109,6 +1376,8 @@ def main() -> int:
                     output_path=str(destination),
                 )
                 write_csv_rows(OUTPUT_CSV, fieldnames, rows)
+                successful_downloads += 1
+                maybe_clear_browser_cache(successful_downloads)
                 break
 
             print("  [TIMEOUT] no download detected")
