@@ -1,4 +1,11 @@
-"""Open DOI-based URLs in a browser and rename downloaded PDFs."""
+'''
+Implemented the “tier” concept.
+Tier 1 processes verified publisher rules and direct PDF URLs first.
+Tier 2 handles EBSCO, and unknown publishers manually.
+Preserves original CSV order within each publisher group.
+Displays automatic/manual counts and the mode for every record.
+Prevents AppleScript automation on manual-only pages.
+'''
 
 from __future__ import annotations
 
@@ -12,16 +19,17 @@ import subprocess
 import sys
 import time
 import webbrowser
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
-
-import requests
+from typing import Iterable, Mapping
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, unquote, urlparse
+from urllib.request import Request, urlopen
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
-DOWNLOADS_DIR = (PROJECT_ROOT / "downloads").resolve()
-UNPAYWALL_PDF_DIR = (DOWNLOADS_DIR / "unpaywall").resolve()
 BROWSER_PDF_DIR = (PROJECT_ROOT / "browser").resolve()
 BROWSER_WATCH_DIR = (Path.home() / "Downloads").resolve()
 
@@ -49,27 +57,73 @@ DOWNLOAD_RESULT_FIELDS = [
     OUTPUT_PATH_COLUMN,
 ]
 
-EXISTING_PDF_RULES = [
-    {
-        "directory": BROWSER_PDF_DIR,
-        "filename_template": "{pmid}.pdf",
-    },
-]
+EXISTING_PDF_DIRECTORIES = (BROWSER_PDF_DIR,)
 
-def ensure_directory(path: Path) -> Path:
+
+@dataclass(frozen=True)
+class PublisherClickRule:
+    publisher: str
+    pdf_selector: str
+    download_selector: str | None = None
+    reveal_download_selector: str | None = None
+
+
+@dataclass(frozen=True)
+class FileSnapshot:
+    size: int
+    modified_ns: int
+
+
+@dataclass(frozen=True)
+class DownloadStrategy:
+    priority: int
+    automatic: bool
+    label: str
+
+
+def ensure_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
-    return path
 
 
 def normalize_cell(value: str | None) -> str:
     return (value or "").strip()
 
 
+def normalize_pmid(value: str | None) -> str:
+    pmid = normalize_cell(value)
+    return pmid if pmid.isascii() and pmid.isdecimal() else ""
+
+
+def normalize_doi(value: str | None) -> str:
+    """Normalize common DOI representations while preserving DOI case."""
+    cleaned = normalize_cell(value)
+    if cleaned.casefold().startswith("doi:"):
+        cleaned = cleaned[4:].strip()
+
+    parsed = urlparse(cleaned)
+    host = (parsed.hostname or "").casefold()
+    if parsed.scheme.casefold() in {"http", "https"} and host in {
+        "doi.org",
+        "dx.doi.org",
+    }:
+        return unquote(parsed.path.lstrip("/")).strip()
+    return cleaned
+
+
+def is_http_url(value: str) -> bool:
+    parsed = urlparse(value)
+    return parsed.scheme.casefold() in {"http", "https"} and bool(parsed.netloc)
+
+
+def encoded_doi(doi: str) -> str:
+    return quote(doi, safe="/:()._-;")
+
+
 def is_yes(value: str | None) -> bool:
     return normalize_cell(value).upper() == TARGET_ENABLED_VALUE
 
 
-def ensure_columns(fieldnames: list[str], required_columns: list[str]) -> list[str]:
+def ensure_columns(fieldnames: list[str], required_columns: Iterable[str]) -> list[str]:
     merged = list(fieldnames)
     for column in required_columns:
         if column not in merged:
@@ -78,9 +132,18 @@ def ensure_columns(fieldnames: list[str], required_columns: list[str]) -> list[s
 
 
 def load_csv_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
-    with path.open(encoding="utf-8", newline="") as handle:
+    with path.open(encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
-        return list(reader.fieldnames or []), list(reader)
+        fieldnames = list(reader.fieldnames or [])
+        if len(fieldnames) != len(set(fieldnames)):
+            raise ValueError("Input CSV contains duplicate column names")
+
+        rows: list[dict[str, str]] = []
+        for line_number, row in enumerate(reader, start=2):
+            if None in row:
+                raise ValueError(f"Input CSV has extra values on line {line_number}")
+            rows.append({key: value or "" for key, value in row.items()})
+        return fieldnames, rows
 
 
 def write_csv_rows(path: Path, fieldnames: list[str], rows: list[dict[str, str]]) -> None:
@@ -107,9 +170,38 @@ INTERACTIVE_SKIP = True
 DRY_RUN = False
 OPEN_COMMAND: str | None = None
 BATCH_LOG_PATH: Path | None = None
+# Matching URLs are recorded as skipped instead of silently disappearing.
 BLOCKED_URL_PATTERNS = ["karger.com"]
 AUTOMATE_PUBLISHER_PDF_CLICK = True
 PUBLISHER_CLICK_TIMEOUT_SECONDS = 30
+
+# Lower values run first. Python's stable sort preserves CSV order within each
+# publisher group, while all verified automatic routes stay ahead of records
+# that need manual review.
+AUTO_PUBLISHER_PRIORITY = {
+    "ScienceDirect": 0,
+    "ACS": 10,
+    "Wiley": 20,
+    "SAGE": 30,
+    "RSC": 40,
+    "Taylor & Francis": 50,
+    "Oxford Academic": 60,
+    "IOPscience": 70,
+    "IIAR Journals": 80,
+    "AACR Journals": 90,
+    "JAMA Network": 100,
+}
+DIRECT_PDF_PRIORITY = 200
+MANUAL_REVIEW_PRIORITY = 1000
+
+# Some institution-provided URLs contain opaque record IDs and cannot be
+# derived from a DOI. Keep those exceptional mappings explicit and auditable.
+INSTITUTIONAL_URL_OVERRIDES = {
+    "10.1007/s13277-015-4345-7": (
+        "https://research-ebsco-com.proxy.lib.ohio-state.edu/"
+        "c/wpogxq/viewer/pdf/qvffijf37b?route=details"
+    ),
+}
 
 SCIENCEDIRECT_PROXY_HOST = "www-sciencedirect-com.proxy.lib.ohio-state.edu"
 SCIENCEDIRECT_ARTICLE_BASE_URL = (
@@ -117,12 +209,13 @@ SCIENCEDIRECT_ARTICLE_BASE_URL = (
 )
 ACS_PROXY_HOST = "pubs-acs-org.proxy.lib.ohio-state.edu"
 ACS_ARTICLE_BASE_URL = f"https://{ACS_PROXY_HOST}/doi/full"
-WILEY_PROXY_HOST = (
-    "analyticalsciencejournals-onlinelibrary-wiley-com.proxy.lib.ohio-state.edu"
-)
+WILEY_PROXY_HOST = "onlinelibrary-wiley-com.proxy.lib.ohio-state.edu"
 WILEY_ARTICLE_BASE_URL = f"https://{WILEY_PROXY_HOST}/doi/full"
 SAGE_PROXY_HOST = "journals-sagepub-com.proxy.lib.ohio-state.edu"
 SAGE_ARTICLE_BASE_URL = f"https://{SAGE_PROXY_HOST}/doi/full"
+LIEBERT_ARTICLE_BASE_URL = "https://www.liebertpub.com/doi/pdf"
+TANDF_PROXY_HOST = "www-tandfonline-com.proxy.lib.ohio-state.edu"
+TANDF_ARTICLE_BASE_URL = f"https://{TANDF_PROXY_HOST}/doi/full"
 
 TEMP_SUFFIXES = {".crdownload", ".part", ".download", ".tmp"}
 
@@ -139,7 +232,9 @@ DOI_PREFIX_RULES: list[tuple[str, str]] = [
     ("10.1126/", "https://www.science.org/doi/pdf/{doi}"),
     ("10.1128/", "https://journals.asm.org/doi/pdf/{doi}"),
     ("10.1177/", f"{SAGE_ARTICLE_BASE_URL}/{{doi}}"),
-    ("10.1089/", f"{SAGE_ARTICLE_BASE_URL}/{{doi}}"),
+    ("10.1089/", f"{LIEBERT_ARTICLE_BASE_URL}/{{doi}}"),
+    ("10.1080/", f"{TANDF_ARTICLE_BASE_URL}/{{doi}}"),
+    ("10.1088/", "https://iopscience.iop.org/article/{doi}"),
 ]
 
 
@@ -152,8 +247,10 @@ def strip_doi_path_slug(after_doi: str) -> str:
 
 def is_wiley_host(host: str) -> bool:
     return (
-        host.endswith("onlinelibrary.wiley.com")
-        or host.endswith("onlinelibrary-wiley-com.proxy.lib.ohio-state.edu")
+        host == "onlinelibrary.wiley.com"
+        or host.endswith(".onlinelibrary.wiley.com")
+        or host == WILEY_PROXY_HOST
+        or host.endswith("-onlinelibrary-wiley-com.proxy.lib.ohio-state.edu")
     )
 
 
@@ -161,58 +258,104 @@ def is_sage_host(host: str) -> bool:
     return host == "journals.sagepub.com" or host == SAGE_PROXY_HOST
 
 
+def is_tandfonline_host(host: str) -> bool:
+    return (
+        host in {"tandfonline.com", "www.tandfonline.com", TANDF_PROXY_HOST}
+        or host.endswith(".tandfonline.com")
+        or host.endswith("-tandfonline-com.proxy.lib.ohio-state.edu")
+    )
+
+
+def is_public_or_osu_proxy_host(host: str, public_domain: str) -> bool:
+    """Match a publisher's public hosts and OSU EZproxy host variants."""
+    proxy_host = (
+        f"{public_domain.replace('.', '-')}.proxy.lib.ohio-state.edu"
+    )
+    return (
+        host == public_domain
+        or host.endswith(f".{public_domain}")
+        or host == proxy_host
+        or host.endswith(f"-{proxy_host}")
+    )
+
+
+def institutional_url_override(doi: str) -> str:
+    normalized = normalize_doi(doi).casefold()
+    for configured_doi, url in INSTITUTIONAL_URL_OVERRIDES.items():
+        if normalize_doi(configured_doi).casefold() == normalized:
+            return url
+    return ""
+
+
+def doi_from_doi_path(path: str) -> str:
+    if "/doi/" not in path:
+        return ""
+    value = strip_doi_path_slug(path.split("/doi/", 1)[1]).strip("/")
+    return unquote(value) if value.casefold().startswith("10.") else ""
+
+
 def rewrite_resolved_url(url: str) -> str:
     parsed = urlparse(url)
-    host = parsed.netloc.lower()
+    host = (parsed.hostname or "").casefold()
     path = parsed.path
+    doi = doi_from_doi_path(path)
+    quoted_doi = encoded_doi(doi)
 
-    if is_wiley_host(host) and "/doi/" in path:
-        after = strip_doi_path_slug(path.split("/doi/", 1)[1])
-        if after.startswith("10."):
-            return f"{WILEY_ARTICLE_BASE_URL}/{after.split('?')[0]}"
+    if is_wiley_host(host) and doi:
+        return f"{WILEY_ARTICLE_BASE_URL}/{quoted_doi}"
 
-    if host in ("pubs.acs.org", ACS_PROXY_HOST) and "/doi/" in path:
-        after = strip_doi_path_slug(path.split("/doi/", 1)[1])
-        if after.startswith("10."):
-            return f"{ACS_ARTICLE_BASE_URL}/{after.split('?')[0]}"
+    if host in ("pubs.acs.org", ACS_PROXY_HOST) and doi:
+        return f"{ACS_ARTICLE_BASE_URL}/{quoted_doi}"
 
     if host.endswith("frontiersin.org"):
         if path.endswith("/full"):
-            return url[: -len("/full")] + "/pdf"
+            return parsed._replace(
+                path=path.removesuffix("/full") + "/pdf",
+                query="",
+                fragment="",
+            ).geturl()
         if "/articles/" in path and not path.endswith("/pdf"):
-            return url.rstrip("/") + "/pdf"
+            return parsed._replace(
+                path=path.rstrip("/") + "/pdf",
+                query="",
+                fragment="",
+            ).geturl()
 
     if host == "pubs.rsc.org" and "/articlelanding/" in path:
         return url.replace("/articlelanding/", "/articlepdf/")
 
     if host == "elifesciences.org" and "/articles/" in path:
-        article_id = path.split("/articles/")[-1].split("/")[0].split("?")[0]
+        article_id = path.split("/articles/", 1)[1].split("/", 1)[0]
         if article_id and not article_id.endswith(".pdf"):
             return f"https://elifesciences.org/articles/{article_id}.pdf"
 
-    if host in ("pnas.org", "www.pnas.org") and "/doi/" in path:
-        after = strip_doi_path_slug(path.split("/doi/", 1)[1])
-        return f"https://www.pnas.org/doi/pdf/{after.split('?')[0]}"
+    if host in ("pnas.org", "www.pnas.org") and doi:
+        return f"https://www.pnas.org/doi/pdf/{quoted_doi}"
 
-    if host in ("science.org", "www.science.org") and "/doi/" in path:
-        after = strip_doi_path_slug(path.split("/doi/", 1)[1])
-        return f"https://www.science.org/doi/pdf/{after.split('?')[0]}"
+    if host in ("science.org", "www.science.org") and doi:
+        return f"https://www.science.org/doi/pdf/{quoted_doi}"
 
-    if host == "journals.asm.org" and "/doi/" in path:
-        after = strip_doi_path_slug(path.split("/doi/", 1)[1])
-        return f"https://journals.asm.org/doi/pdf/{after.split('?')[0]}"
+    if host == "journals.asm.org" and doi:
+        return f"https://journals.asm.org/doi/pdf/{quoted_doi}"
 
-    if is_sage_host(host) and "/doi/" in path:
-        after = strip_doi_path_slug(path.split("/doi/", 1)[1])
-        return f"{SAGE_ARTICLE_BASE_URL}/{after.split('?')[0]}"
+    if is_sage_host(host) and doi:
+        return f"{SAGE_ARTICLE_BASE_URL}/{quoted_doi}"
+
+    if host.endswith("liebertpub.com") and doi:
+        return f"{LIEBERT_ARTICLE_BASE_URL}/{quoted_doi}"
+
+    if is_tandfonline_host(host) and doi:
+        if "/doi/epdf/" in path or "/doi/pdf/" in path:
+            return url
+        return f"{TANDF_ARTICLE_BASE_URL}/{quoted_doi}"
 
     if host == "linkinghub.elsevier.com" and "/retrieve/pii/" in path:
-        pii = path.split("/retrieve/pii/")[-1].strip("/").split("?")[0]
+        pii = path.split("/retrieve/pii/", 1)[1].strip("/").split("/", 1)[0]
         if pii:
             return f"{SCIENCEDIRECT_ARTICLE_BASE_URL}/{pii}"
 
     if host.endswith("sciencedirect.com") and "/article/pii/" in path:
-        pii = path.split("/article/pii/")[-1].strip("/").split("?")[0]
+        pii = path.split("/article/pii/", 1)[1].strip("/").split("/", 1)[0]
         if pii:
             return f"{SCIENCEDIRECT_ARTICLE_BASE_URL}/{pii}"
 
@@ -220,7 +363,7 @@ def rewrite_resolved_url(url: str) -> str:
         if path.startswith("/content/pdf/") and path.endswith(".pdf"):
             return url
         if path.startswith("/article/"):
-            doi_part = path.replace("/article/", "").strip("/")
+            doi_part = path.removeprefix("/article/").strip("/")
             if doi_part:
                 return f"https://link.springer.com/content/pdf/{doi_part}.pdf"
 
@@ -228,30 +371,30 @@ def rewrite_resolved_url(url: str) -> str:
 
 
 def resolve_best_pdf_url(doi: str, resolve_timeout: float = 8.0) -> str:
-    doi = doi.strip()
+    doi = normalize_doi(doi)
     if not doi:
         return ""
-    if doi.startswith("http"):
+    if is_http_url(doi):
         return rewrite_resolved_url(doi)
-    if doi.startswith("10.7554/eLife."):
-        article_id = doi.split("eLife.")[-1]
+    if doi.casefold().startswith("10.7554/elife."):
+        article_id = doi.rsplit(".", 1)[-1]
         return f"https://elifesciences.org/articles/{article_id}.pdf"
 
     for prefix, template in DOI_PREFIX_RULES:
-        if doi.startswith(prefix):
-            return template.format(doi=doi)
+        if doi.casefold().startswith(prefix.casefold()):
+            return template.format(doi=encoded_doi(doi))
 
-    doi_url = f"https://doi.org/{doi}"
+    doi_url = f"https://doi.org/{encoded_doi(doi)}"
     try:
-        response = requests.head(
+        request = Request(
             doi_url,
-            allow_redirects=True,
-            timeout=resolve_timeout,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; browser-pdf-fetch/1.0)"},
+            method="HEAD",
+            headers={"User-Agent": "Mozilla/5.0 (browser-pdf-fetch/2.0)"},
         )
-        resolved = response.url
+        with urlopen(request, timeout=resolve_timeout) as response:
+            resolved = response.geturl()
         print(f"  [RESOLVE] {doi_url} -> {resolved}")
-    except Exception as exc:  # noqa: BLE001
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
         print(f"  [RESOLVE] failed ({exc}), falling back to doi.org URL")
         return doi_url
 
@@ -261,22 +404,62 @@ def resolve_best_pdf_url(doi: str, resolve_timeout: float = 8.0) -> str:
     return rewritten
 
 
-def is_blocked(url: str) -> bool:
+def matching_blocked_pattern(url: str) -> str:
     lowered = url.lower()
-    return any(pattern.lower() in lowered for pattern in BLOCKED_URL_PATTERNS)
+    for pattern in BLOCKED_URL_PATTERNS:
+        cleaned = pattern.strip()
+        if cleaned and cleaned.casefold() in lowered:
+            return cleaned
+    return ""
 
 
 def completed_files(directory: Path) -> list[Path]:
     results: list[Path] = []
-    for path in directory.iterdir():
-        if not path.is_file():
-            continue
-        if path.suffix.lower() in TEMP_SUFFIXES:
-            continue
-        if any(Path(str(path) + suffix).exists() for suffix in TEMP_SUFFIXES):
-            continue
-        results.append(path)
+    try:
+        paths = directory.iterdir()
+        for path in paths:
+            try:
+                if not path.is_file():
+                    continue
+                if path.suffix.casefold() in TEMP_SUFFIXES:
+                    continue
+                if any(Path(f"{path}{suffix}").exists() for suffix in TEMP_SUFFIXES):
+                    continue
+                results.append(path)
+            except OSError:
+                # Browser downloads can be renamed between discovery and stat calls.
+                continue
+    except OSError as exc:
+        print(f"  [WATCH] unable to scan {directory}: {exc}")
     return results
+
+
+def file_snapshot(path: Path) -> FileSnapshot | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return FileSnapshot(size=stat.st_size, modified_ns=stat.st_mtime_ns)
+
+
+def snapshot_completed_files(directory: Path) -> dict[Path, FileSnapshot]:
+    snapshot: dict[Path, FileSnapshot] = {}
+    for path in completed_files(directory):
+        state = file_snapshot(path)
+        if state is not None:
+            snapshot[path.resolve()] = state
+    return snapshot
+
+
+def is_pdf_file(path: Path) -> bool:
+    """Validate PDF content rather than trusting its filename extension."""
+    try:
+        if path.stat().st_size < MIN_FILE_SIZE_BYTES:
+            return False
+        with path.open("rb") as handle:
+            return b"%PDF-" in handle.read(1024)
+    except OSError:
+        return False
 
 
 def read_skip_nonblocking() -> bool:
@@ -297,25 +480,33 @@ def read_skip_nonblocking() -> bool:
     return sys.stdin.readline().strip().lower() == "s"
 
 
-def wait_for_download(known: set[Path]) -> tuple[Path | None, bool]:
-    deadline = time.time() + WAIT_TIMEOUT_SECONDS
-    while time.time() < deadline:
+def wait_for_download(
+    known: Mapping[Path, FileSnapshot],
+) -> tuple[Path | None, bool]:
+    deadline = time.monotonic() + WAIT_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
         if INTERACTIVE_SKIP and read_skip_nonblocking():
             return None, True
 
-        candidates = [
-            path for path in completed_files(WATCH_DIR)
-            if path.resolve() not in known and path.stat().st_size >= MIN_FILE_SIZE_BYTES
-        ]
+        candidates: list[tuple[Path, FileSnapshot]] = []
+        for path in completed_files(WATCH_DIR):
+            resolved_path = path.resolve()
+            state = file_snapshot(path)
+            if state is None or state == known.get(resolved_path):
+                continue
+            if is_pdf_file(path):
+                candidates.append((path, state))
+
         if candidates:
-            return max(candidates, key=lambda path: path.stat().st_mtime), False
+            newest, _ = max(candidates, key=lambda item: item[1].modified_ns)
+            return newest, False
 
         time.sleep(POLL_INTERVAL_SECONDS)
 
     return None, False
 
 
-def log_event(payload: dict) -> None:
+def log_event(payload: Mapping[str, object]) -> None:
     if BATCH_LOG_PATH is None:
         return
     BATCH_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -323,41 +514,174 @@ def log_event(payload: dict) -> None:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
-def publisher_pdf_click_rule(url: str) -> tuple[str, str, str | None] | None:
-    host = urlparse(url).netloc.lower().split(":", 1)[0]
+def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
+    host = (urlparse(url).hostname or "").casefold()
     if host.endswith("sciencedirect.com") or host == SCIENCEDIRECT_PROXY_HOST:
-        return (
-            "ScienceDirect",
-            'a[aria-label^="View PDF"][href*="/pdfft"], a[href*="/pdfft"]',
-            None,
+        return PublisherClickRule(
+            publisher="ScienceDirect",
+            pdf_selector=(
+                'a[aria-label^="View PDF"][href*="/pdfft"], a[href*="/pdfft"]'
+            ),
         )
     if host in ("pubs.acs.org", ACS_PROXY_HOST):
-        return (
-            "ACS",
-            'a[data-id="article_header_OpenPDF"][href*="/doi/pdf/"], '
-            'a.article__btn__secondary--pdf[href*="/doi/pdf/"]',
-            None,
+        return PublisherClickRule(
+            publisher="ACS",
+            pdf_selector=(
+                'a[data-id="article_header_OpenPDF"][href*="/doi/pdf/"], '
+                'a.article__btn__secondary--pdf[href*="/doi/pdf/"]'
+            ),
         )
     if is_wiley_host(host):
-        return (
-            "Wiley",
-            'a.pdf-download[href*="/doi/epdf/"], '
-            'a[title="ePDF"][href*="/doi/epdf/"]',
-            'a.navbar-download[href*="/doi/pdfdirect/"][data-single-download="true"], '
-            'a.navbar-download[href*="/doi/pdfdirect/"], '
-            'div.navbar-download a.download[data-download-files-key="pdf"]'
-            '[href*="/doi/pdfdirect/"], '
-            'a.download[data-download-files-key="pdf"][href*="/doi/pdfdirect/"]',
+        return PublisherClickRule(
+            publisher="Wiley",
+            pdf_selector=(
+                'a.pdf-download[href*="/doi/epdf/"], '
+                'a[title="ePDF"][href*="/doi/epdf/"]'
+            ),
+            download_selector=(
+                'a.navbar-download[href*="/doi/pdfdirect/"]'
+                '[data-single-download="true"], '
+                'a.navbar-download[href*="/doi/pdfdirect/"], '
+                'div.navbar-download a.download[data-download-files-key="pdf"]'
+                '[href*="/doi/pdfdirect/"], '
+                'a.download[data-download-files-key="pdf"]'
+                '[href*="/doi/pdfdirect/"]'
+            ),
         )
     if is_sage_host(host):
-        return (
-            "SAGE",
-            'a[data-id="article-toolbar-pdf-epub"][href*="/doi/reader/"], '
-            'a[href*="/doi/reader/"]',
-            'a#favourite-download[href*="/doi/pdf/"], '
-            'a[aria-label="Download PDF"][href*="/doi/pdf/"]',
+        return PublisherClickRule(
+            publisher="SAGE",
+            pdf_selector=(
+                'a[data-id="article-toolbar-pdf-epub"][href*="/doi/reader/"], '
+                'a[href*="/doi/reader/"]'
+            ),
+            download_selector=(
+                'a#favourite-download[href*="/doi/pdf/"], '
+                'a[aria-label="Download PDF"][href*="/doi/pdf/"]'
+            ),
+        )
+    if host == "pubs.rsc.org" or host.endswith(
+        "-rsc-org.proxy.lib.ohio-state.edu"
+    ):
+        return PublisherClickRule(
+            publisher="RSC",
+            pdf_selector=(
+                'a.article-pdfLink[href*="/article-pdf/"], '
+                'a[data-doctype="contentPdf"][href*="/article-pdf/"]'
+            ),
+        )
+    if is_tandfonline_host(host):
+        return PublisherClickRule(
+            publisher="Taylor & Francis",
+            pdf_selector=(
+                'a.show-pdf[href*="/doi/epdf/"], '
+                'a[role="button"][href*="/doi/epdf/"]'
+            ),
+            download_selector=(
+                'a.download[data-download-files-key="pdf"][href*="/doi/pdf/"], '
+                'a[data-single-download="true"][href*="/doi/pdf/"]'
+            ),
+            reveal_download_selector=(
+                'button#new-download-btn[aria-label="Download"], '
+                'button[aria-label="Download"][aria-haspopup="true"]'
+            ),
+        )
+    if host == "academic.oup.com" or host.endswith(
+        "-oup-com.proxy.lib.ohio-state.edu"
+    ):
+        return PublisherClickRule(
+            publisher="Oxford Academic",
+            pdf_selector=(
+                'li.item-pdf a.article-pdfLink[href*="/article-pdf/"], '
+                'a.article-pdfLink[href*="/article-pdf/"]'
+            ),
+        )
+    if host == "iopscience.iop.org" or host.endswith(
+        "-iop-org.proxy.lib.ohio-state.edu"
+    ):
+        return PublisherClickRule(
+            publisher="IOPscience",
+            pdf_selector=(
+                'a.content-download[href*="/article/"][href$="/pdf"], '
+                'a[itemprop="sameAs"][href$="/pdf"]'
+            ),
+        )
+    if is_public_or_osu_proxy_host(host, "iiarjournals.org"):
+        return PublisherClickRule(
+            publisher="IIAR Journals",
+            pdf_selector=(
+                'a[data-trigger="tab-pdf"][href$=".full.pdf"], '
+                'a[href*="/content/anticanres/"][href$=".full.pdf"]'
+            ),
+        )
+    if is_public_or_osu_proxy_host(host, "aacrjournals.org"):
+        return PublisherClickRule(
+            publisher="AACR Journals",
+            pdf_selector=(
+                'a.article-pdfLink[data-doctype="contentPdf"]'
+                '[href*="/article-pdf/"], '
+                'a.article-pdfLink[href*="/article-pdf/"]'
+            ),
+        )
+    if is_public_or_osu_proxy_host(host, "jamanetwork.com"):
+        return PublisherClickRule(
+            publisher="JAMA Network",
+            pdf_selector=(
+                'a#pdf-link.js-pdfaccess[data-article-url$=".pdf"], '
+                'a.js-pdfaccess[aria-label="Download PDF"]'
+                '[data-article-url$=".pdf"]'
+            ),
         )
     return None
+
+
+def download_strategy(url: str) -> DownloadStrategy:
+    """Classify a prepared URL into the automatic or manual-review tier."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").casefold()
+    path = parsed.path.casefold()
+
+    # These viewers use opaque, session-dependent controls. Keep them visible
+    # for a human instead of attempting an unsafe speculative click.
+    if host.endswith("ebsco-com.proxy.lib.ohio-state.edu"):
+        return DownloadStrategy(
+            priority=MANUAL_REVIEW_PRIORITY,
+            automatic=False,
+            label="EBSCO institutional viewer",
+        )
+
+    click_rule = publisher_pdf_click_rule(url)
+    if click_rule is not None:
+        return DownloadStrategy(
+            priority=AUTO_PUBLISHER_PRIORITY.get(
+                click_rule.publisher,
+                DIRECT_PDF_PRIORITY - 1,
+            ),
+            automatic=True,
+            label=click_rule.publisher,
+        )
+
+    direct_pdf_patterns = (
+        "/article-pdf/",
+        "/content/pdf/",
+        "/doi/pdf/",
+        "/pdf/",
+        "/pdfft/",
+    )
+    if path.endswith(".pdf") or any(
+        pattern in path for pattern in direct_pdf_patterns
+    ):
+        return DownloadStrategy(
+            priority=DIRECT_PDF_PRIORITY,
+            automatic=True,
+            label="direct PDF URL",
+        )
+
+    return DownloadStrategy(
+        priority=MANUAL_REVIEW_PRIORITY,
+        automatic=False,
+        label=host or "unresolved publisher",
+    )
 
 
 def open_publisher_and_click_pdf(
@@ -365,6 +689,7 @@ def open_publisher_and_click_pdf(
     publisher: str,
     selector: str,
     download_selector: str | None,
+    reveal_download_selector: str | None,
 ) -> bool:
     """Open a publisher article and click through to its final PDF download."""
     if sys.platform != "darwin" or not shutil.which("osascript"):
@@ -374,12 +699,22 @@ def open_publisher_and_click_pdf(
     javascript = """
 (() => {
   const downloadSelector = __DOWNLOAD_SELECTOR__;
+  const revealDownloadSelector = __REVEAL_DOWNLOAD_SELECTOR__;
   if (downloadSelector) {
     const downloadLink = document.querySelector(downloadSelector);
     if (downloadLink) {
       downloadLink.target = '_self';
       downloadLink.click();
       return 'download_clicked';
+    }
+  }
+
+  if (revealDownloadSelector) {
+    const revealButton = document.querySelector(revealDownloadSelector);
+    if (revealButton && revealButton.dataset.automatedRevealClick !== 'true') {
+      revealButton.dataset.automatedRevealClick = 'true';
+      revealButton.click();
+      return 'download_menu_opened';
     }
   }
 
@@ -393,6 +728,8 @@ def open_publisher_and_click_pdf(
 })()
 """.replace(
         "__DOWNLOAD_SELECTOR__", json.dumps(download_selector)
+    ).replace(
+        "__REVEAL_DOWNLOAD_SELECTOR__", json.dumps(reveal_download_selector)
     ).replace(
         "__PDF_SELECTOR__", json.dumps(selector)
     ).strip()
@@ -414,6 +751,7 @@ on run argv
                 set clickResult to execute articleTab javascript clickScript
                 if clickResult is "download_clicked" then return "download_clicked"
                 if clickResult is "pdf_page_opened" then set pdfPageOpened to true
+                if clickResult is "download_menu_opened" then set pdfPageOpened to true
             on error errorMessage
                 set lastJavaScriptError to errorMessage
             end try
@@ -432,7 +770,11 @@ end run
             check=False,
             capture_output=True,
             text=True,
+            timeout=PUBLISHER_CLICK_TIMEOUT_SECONDS + 10,
         )
+    except subprocess.TimeoutExpired:
+        print(f"  [AUTO-PDF] {publisher} automation timed out")
+        return False
     except OSError as exc:
         print(f"  [AUTO-PDF] Chrome automation unavailable: {exc}")
         return False
@@ -465,12 +807,15 @@ def open_url(url: str) -> None:
         subprocess.run([*shlex.split(OPEN_COMMAND), url], check=False)
         return
 
-    if AUTOMATE_PUBLISHER_PDF_CLICK:
+    if AUTOMATE_PUBLISHER_PDF_CLICK and download_strategy(url).automatic:
         click_rule = publisher_pdf_click_rule(url)
         if click_rule:
-            publisher, selector, download_selector = click_rule
             if open_publisher_and_click_pdf(
-                url, publisher, selector, download_selector
+                url,
+                click_rule.publisher,
+                click_rule.pdf_selector,
+                click_rule.download_selector,
+                click_rule.reveal_download_selector,
             ):
                 return
 
@@ -478,58 +823,148 @@ def open_url(url: str) -> None:
 
 
 def existing_pdf_path(pmid: str) -> Path | None:
-    for rule in EXISTING_PDF_RULES:
-        candidate = rule["directory"] / rule["filename_template"].format(pmid=pmid)
-        if candidate.is_file() and candidate.stat().st_size >= MIN_FILE_SIZE_BYTES:
+    for directory in EXISTING_PDF_DIRECTORIES:
+        candidate = directory / f"{pmid}.pdf"
+        if candidate.is_file() and is_pdf_file(candidate):
             return candidate
     return None
 
 
-def write_result(row: dict[str, str], *, status: str, error: str = "", started_at: str = "", finished_at: str = "", filename: str = "", url: str = "", output_path: str = "") -> None:
-    row[FETCH_STATUS_COLUMN] = status
-    row[FETCH_SOURCE_COLUMN] = "browser"
-    row[FETCH_ERROR_COLUMN] = error
-    if started_at:
-        row[DOWNLOAD_STARTED_AT_COLUMN] = started_at
-    if finished_at:
-        row[DOWNLOAD_FINISHED_AT_COLUMN] = finished_at
-    if filename:
-        row[DOWNLOAD_FILENAME_COLUMN] = filename
-    if url:
-        row[DOWNLOAD_URL_COLUMN] = url
-    if output_path:
-        row[OUTPUT_PATH_COLUMN] = output_path
+def now_timestamp() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def build_queue(rows: list[dict[str, str]], *, require_target_flag: bool) -> list[dict[str, str]]:
-    queue: list[dict[str, str]] = []
+def write_result(
+    row: dict[str, str],
+    *,
+    status: str,
+    source: str = "browser",
+    error: str = "",
+    started_at: str = "",
+    finished_at: str = "",
+    filename: str = "",
+    url: str = "",
+    output_path: str = "",
+) -> None:
+    """Write a complete result state, clearing fields from any prior attempt."""
+    row.update(
+        {
+            FETCH_STATUS_COLUMN: status,
+            FETCH_SOURCE_COLUMN: source,
+            FETCH_ERROR_COLUMN: error,
+            DOWNLOAD_STARTED_AT_COLUMN: started_at,
+            DOWNLOAD_FINISHED_AT_COLUMN: finished_at,
+            DOWNLOAD_FILENAME_COLUMN: filename,
+            DOWNLOAD_URL_COLUMN: url,
+            OUTPUT_PATH_COLUMN: output_path,
+        }
+    )
+
+
+def build_queue(
+    rows: list[dict[str, str]], *, require_target_flag: bool
+) -> list[dict[str, str]]:
+    eligible: list[tuple[dict[str, str], str, str]] = []
     seen_pmids: set[str] = set()
 
     for row in rows:
         if require_target_flag and not is_yes(row.get(IS_FETCH_TARGET_COLUMN)):
             continue
 
-        pmid = normalize_cell(row.get(PMID_COLUMN))
-        doi = normalize_cell(row.get(DOI_COLUMN))
-        if not pmid or pmid in seen_pmids:
+        raw_pmid = normalize_cell(row.get(PMID_COLUMN))
+        if not raw_pmid:
             continue
-        if existing_pdf_path(pmid) is not None:
+        pmid = normalize_pmid(raw_pmid)
+        if not pmid:
+            write_result(
+                row,
+                status="failed",
+                source="validation",
+                error="invalid_pmid",
+            )
             continue
-        if not doi:
+        if pmid in seen_pmids:
+            write_result(
+                row,
+                status="skipped",
+                source="validation",
+                error="duplicate_pmid",
+            )
             continue
-
-        url = resolve_best_pdf_url(doi)
-        if is_blocked(url):
-            continue
-
-        row[DOWNLOAD_URL_COLUMN] = url
-        queue.append(row)
         seen_pmids.add(pmid)
 
-    return queue[BATCH_START:BATCH_START + BATCH_LIMIT]
+        existing = existing_pdf_path(pmid)
+        if existing is not None:
+            write_result(
+                row,
+                status="success",
+                source="existing",
+                filename=existing.name,
+                url=normalize_cell(row.get(DOWNLOAD_URL_COLUMN)),
+                output_path=str(existing),
+            )
+            continue
+
+        doi = normalize_doi(row.get(DOI_COLUMN))
+        if not doi:
+            continue
+        if not is_http_url(doi) and not doi.casefold().startswith("10."):
+            write_result(
+                row,
+                status="failed",
+                source="validation",
+                error="invalid_doi",
+            )
+            continue
+
+        eligible.append((row, pmid, doi))
+
+    selected = eligible[BATCH_START:BATCH_START + BATCH_LIMIT]
+    queue: list[dict[str, str]] = []
+    for row, pmid, doi in selected:
+        existing_url = normalize_cell(row.get(DOWNLOAD_URL_COLUMN))
+        override_url = institutional_url_override(doi)
+        if override_url:
+            url = override_url
+            if url != existing_url:
+                print(f"  [OVERRIDE] doi={doi} -> {url}")
+        elif is_http_url(existing_url):
+            url = rewrite_resolved_url(existing_url)
+            if url != existing_url:
+                print(f"  [REWRITE] {existing_url} -> {url}")
+        else:
+            url = resolve_best_pdf_url(doi)
+
+        blocked_pattern = matching_blocked_pattern(url)
+        if blocked_pattern:
+            print(f"  [SKIP URL] pmid={pmid} pattern={blocked_pattern} url={url}")
+            write_result(
+                row,
+                status="skipped",
+                source="skip_rule",
+                error=f"blocked_url_pattern:{blocked_pattern}",
+                url=url,
+            )
+            continue
+
+        write_result(row, status="pending", url=url)
+        queue.append(row)
+
+    queue.sort(
+        key=lambda queued_row: download_strategy(
+            normalize_cell(queued_row.get(DOWNLOAD_URL_COLUMN))
+        ).priority
+    )
+    return queue
 
 
 def main() -> int:
+    if BATCH_START < 0 or BATCH_LIMIT <= 0:
+        print("BATCH_START must be >= 0 and BATCH_LIMIT must be > 0")
+        return 1
+    if WAIT_TIMEOUT_SECONDS <= 0 or POLL_INTERVAL_SECONDS <= 0:
+        print("Download timeout and polling interval must be positive")
+        return 1
     if not INPUT_CSV.exists():
         print(f"Input CSV not found: {INPUT_CSV}")
         return 1
@@ -537,7 +972,11 @@ def main() -> int:
     ensure_directory(WATCH_DIR)
     ensure_directory(OUTPUT_DIR)
 
-    fieldnames, rows = load_csv_rows(INPUT_CSV)
+    try:
+        fieldnames, rows = load_csv_rows(INPUT_CSV)
+    except (OSError, ValueError) as exc:
+        print(f"Unable to read input CSV: {exc}")
+        return 1
     if not rows:
         print("Input CSV is empty.")
         return 0
@@ -546,36 +985,67 @@ def main() -> int:
         return 1
 
     require_target_flag = any(normalize_cell(row.get(IS_FETCH_TARGET_COLUMN)) for row in rows)
-    fieldnames = ensure_columns(fieldnames, DOWNLOAD_RESULT_FIELDS + [IS_FETCH_TARGET_COLUMN, DOI_COLUMN])
+    fieldnames = ensure_columns(
+        fieldnames,
+        [*DOWNLOAD_RESULT_FIELDS, IS_FETCH_TARGET_COLUMN, DOI_COLUMN],
+    )
     queue = build_queue(rows, require_target_flag=require_target_flag)
+
+    # Persist validation, existing-file, skip-rule, and pending states even when
+    # there are no automatic browser targets.
+    if not DRY_RUN:
+        write_csv_rows(OUTPUT_CSV, fieldnames, rows)
 
     if not queue:
         print("No valid browser targets in this batch.")
         return 0
 
     print(f"[BATCH] count={len(queue)} start={BATCH_START} limit={BATCH_LIMIT}")
+    automatic_count = sum(
+        download_strategy(normalize_cell(row.get(DOWNLOAD_URL_COLUMN))).automatic
+        for row in queue
+    )
+    print(
+        f"[ORDER] automatic={automatic_count} "
+        f"manual_review={len(queue) - automatic_count}"
+    )
     print(f"[WATCH] {WATCH_DIR}")
     print(f"[OUT]   {OUTPUT_DIR}")
 
     for position, row in enumerate(queue, start=1):
-        pmid = normalize_cell(row.get(PMID_COLUMN))
+        pmid = normalize_pmid(row.get(PMID_COLUMN))
         url = normalize_cell(row.get(DOWNLOAD_URL_COLUMN))
+        strategy = download_strategy(url)
         destination = OUTPUT_DIR / f"{pmid}.pdf"
 
         print(f"\n[{position}/{len(queue)}] pmid={pmid}")
+        mode = "automatic" if strategy.automatic else "manual review"
+        print(f"  [MODE] {mode}: {strategy.label}")
         print(f"  URL: {url}")
+        if not strategy.automatic:
+            print("  [ACTION] complete any login, access, or PDF clicks in the browser")
 
-        if destination.exists() and destination.stat().st_size >= MIN_FILE_SIZE_BYTES:
+        if destination.exists() and is_pdf_file(destination):
             print(f"  [SKIP] already exists: {destination.name}")
+            write_result(
+                row,
+                status="success",
+                source="existing",
+                filename=destination.name,
+                url=url,
+                output_path=str(destination),
+            )
+            if not DRY_RUN:
+                write_csv_rows(OUTPUT_CSV, fieldnames, rows)
             continue
 
-        known = {path.resolve() for path in completed_files(WATCH_DIR)}
-        started_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        known = snapshot_completed_files(WATCH_DIR)
+        started_at = now_timestamp()
         log_event({"event": "open", "pmid": pmid, "url": url, "started_at": started_at})
 
         if not DRY_RUN:
             open_url(url)
-        time.sleep(OPEN_DELAY_SECONDS)
+            time.sleep(OPEN_DELAY_SECONDS)
 
         if DRY_RUN:
             continue
@@ -587,15 +1057,35 @@ def main() -> int:
             new_file, skipped = wait_for_download(known)
 
             if skipped:
+                finished_at = now_timestamp()
                 print("  [SKIP] manually skipped")
-                write_result(row, status="skipped", error="manually_skipped", started_at=started_at, url=url)
+                log_event(
+                    {
+                        "event": "skipped",
+                        "pmid": pmid,
+                        "url": url,
+                        "reason": "manually_skipped",
+                        "started_at": started_at,
+                        "finished_at": finished_at,
+                    }
+                )
+                write_result(
+                    row,
+                    status="skipped",
+                    error="manually_skipped",
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    url=url,
+                )
                 write_csv_rows(OUTPUT_CSV, fieldnames, rows)
                 break
 
             if new_file:
-                finished_at = time.strftime("%Y-%m-%d %H:%M:%S")
+                finished_at = now_timestamp()
                 print(f"  [MOVE] {new_file.name} -> {destination.name}")
                 if new_file.resolve() != destination.resolve():
+                    if destination.exists():
+                        destination.unlink()
                     shutil.move(str(new_file), str(destination))
 
                 log_event(
@@ -627,11 +1117,32 @@ def main() -> int:
                 if choice == "r":
                     continue
 
-            write_result(row, status="failed", error="timeout", started_at=started_at, url=url)
+            finished_at = now_timestamp()
+            log_event(
+                {
+                    "event": "failed",
+                    "pmid": pmid,
+                    "url": url,
+                    "reason": "timeout",
+                    "started_at": started_at,
+                    "finished_at": finished_at,
+                }
+            )
+            write_result(
+                row,
+                status="failed",
+                error="timeout",
+                started_at=started_at,
+                finished_at=finished_at,
+                url=url,
+            )
             write_csv_rows(OUTPUT_CSV, fieldnames, rows)
             break
 
-    print(f"Output written to: {OUTPUT_CSV}")
+    if DRY_RUN:
+        print("Dry run complete; CSV and downloaded files were not changed.")
+    else:
+        print(f"Output written to: {OUTPUT_CSV}")
     print("Done.")
     return 0
 
