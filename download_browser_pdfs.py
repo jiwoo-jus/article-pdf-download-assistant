@@ -1,16 +1,16 @@
 '''
-At every configured cleanup interval—currently every 3 successful downloads—the script will Clear disk and code caches. 
+Cookie deletion is now disabled and the previous setting is commented out:
+# CLEAR_COOKIES_WITH_CACHE = True
+CLEAR_COOKIES_WITH_CACHE = False
 
-After each new PDF, the terminal shows:
-[CLEANUP COUNTDOWN] 1 successful PDF(s); next cache/cookie cleanup in 2 successful PDF(s).
-
-At the current interval of 3:
-[CLEANUP START] 3 successful PDFs reached.
-[CACHE CLEAR] Removed ... Chrome cache entries.
-[COOKIE CLEAR] Removed ... cookie database file(s).
-[CLEANUP COMPLETE] CHROME CACHE AND COOKIES WERE CLEARED.
-
-Warnings are displayed prominently if any part fails.
+New behavior:
+Closes each completed automatic article tab.
+After every 10 successful downloads:Closes remaining ScienceDirect tabs.
+Clears cache while preserving cookies.
+Waits 60 seconds.
+Prints when the break begins and ends.
+Leaves unrelated personal tabs open.
+All 24 tests pass. This may reduce browser/session buildup, but it cannot guarantee prevention of an Elsevier server-side IP block.
 '''
 
 from __future__ import annotations
@@ -183,8 +183,14 @@ MANUAL_URL_PATTERNS = ["link.springer.com"]
 AUTOMATE_PUBLISHER_PDF_CLICK = True
 PUBLISHER_CLICK_TIMEOUT_SECONDS = 20
 AUTO_CLEAR_BROWSER_CACHE = True
-CACHE_CLEAR_EVERY_FILES = 3
-CLEAR_COOKIES_WITH_CACHE = True
+CACHE_CLEAR_EVERY_FILES = 10
+# Set to True only if scheduled cleanup should also sign out browser sessions.
+# CLEAR_COOKIES_WITH_CACHE = True
+CLEAR_COOKIES_WITH_CACHE = False
+DOWNLOAD_BREAK_EVERY_FILES = 10
+DOWNLOAD_BREAK_SECONDS = 60
+CLOSE_COMPLETED_AUTOMATIC_TABS = True
+CLOSE_SCIENCEDIRECT_TABS_AT_BREAK = True
 CHROME_PROFILE_DIRECTORY = "Default"
 CHROME_CACHE_ROOT = Path.home() / "Library" / "Caches" / "Google" / "Chrome"
 CHROME_USER_DATA_ROOT = (
@@ -617,6 +623,128 @@ def reopen_chrome() -> bool:
     return False
 
 
+def close_completed_automatic_tab(url: str) -> bool:
+    """Close the active automated tab when it still belongs to the target host."""
+    expected_host = (urlparse(url).hostname or "").casefold()
+    if (
+        not expected_host
+        or sys.platform != "darwin"
+        or not shutil.which("osascript")
+    ):
+        return False
+
+    apple_script = """
+on run argv
+    set expectedHost to item 1 of argv
+    tell application "Google Chrome"
+        if (count of windows) is 0 then return "no_window"
+        set currentTab to active tab of front window
+        set currentUrl to URL of currentTab
+        if currentUrl contains expectedHost then
+            close currentTab
+            return "closed"
+        end if
+        return "different_tab"
+    end tell
+end run
+"""
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", apple_script, expected_host],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"  [TAB CLOSE] unable to close completed tab: {exc}")
+        return False
+
+    if result.stdout.strip() == "closed":
+        print(f"  [TAB CLOSE] closed completed automatic tab for {expected_host}")
+        return True
+    if result.stdout.strip() == "different_tab":
+        print("  [TAB CLOSE] active tab changed; left it open for safety")
+    return False
+
+
+def close_sciencedirect_tabs() -> int:
+    """Close ScienceDirect tabs while preserving tabs for unrelated sites."""
+    if sys.platform != "darwin" or not shutil.which("osascript"):
+        print("  [TAB CLOSE] automatic ScienceDirect tab cleanup requires macOS")
+        return 0
+
+    apple_script = """
+on run argv
+    set proxyHost to item 1 of argv
+    set closedCount to 0
+    tell application "Google Chrome"
+        repeat with windowIndex from (count of windows) to 1 by -1
+            try
+                set browserWindow to window windowIndex
+                repeat with tabIndex from (count of tabs of browserWindow) to 1 by -1
+                    set currentUrl to URL of tab tabIndex of browserWindow
+                    if currentUrl contains "sciencedirect.com" or currentUrl contains proxyHost or currentUrl contains "linkinghub.elsevier.com" then
+                        close tab tabIndex of browserWindow
+                        set closedCount to closedCount + 1
+                    end if
+                end repeat
+            end try
+        end repeat
+    end tell
+    return closedCount
+end run
+"""
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", apple_script, SCIENCEDIRECT_PROXY_HOST],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"  [TAB CLOSE] unable to close ScienceDirect tabs: {exc}")
+        return 0
+
+    if result.returncode != 0:
+        error = result.stderr.strip() or f"osascript exited {result.returncode}"
+        print(f"  [TAB CLOSE] unable to close ScienceDirect tabs: {error}")
+        return 0
+
+    try:
+        closed_count = int(result.stdout.strip() or "0")
+    except ValueError:
+        closed_count = 0
+    print(f"  [TAB CLOSE] closed {closed_count} remaining ScienceDirect tab(s)")
+    return closed_count
+
+
+def download_break_is_due(successful_downloads: int) -> bool:
+    return (
+        DOWNLOAD_BREAK_EVERY_FILES > 0
+        and successful_downloads > 0
+        and successful_downloads % DOWNLOAD_BREAK_EVERY_FILES == 0
+    )
+
+
+def wait_for_scheduled_download_break(successful_downloads: int) -> bool:
+    """Pause after each configured group of successful downloads."""
+    if not download_break_is_due(successful_downloads):
+        return False
+
+    print(
+        "\n------------------------------------------------------------\n"
+        f"[DOWNLOAD BREAK] {successful_downloads} successful PDFs reached.\n"
+        f"Waiting {DOWNLOAD_BREAK_SECONDS} seconds before the next record...\n"
+        "------------------------------------------------------------",
+        flush=True,
+    )
+    time.sleep(DOWNLOAD_BREAK_SECONDS)
+    print("[DOWNLOAD BREAK COMPLETE] Resuming downloads.\n", flush=True)
+    return True
+
+
 def clear_browser_cache() -> bool:
     """Clear Chrome disk caches and, when enabled, its cookie database."""
     found_directory = False
@@ -728,26 +856,38 @@ def maybe_clear_browser_cache(successful_downloads: int) -> bool:
     completed_in_cycle = successful_downloads % CACHE_CLEAR_EVERY_FILES
     if completed_in_cycle:
         remaining = CACHE_CLEAR_EVERY_FILES - completed_in_cycle
+        cleanup_label = "cache/cookie" if CLEAR_COOKIES_WITH_CACHE else "cache"
         print(
             f"  [CLEANUP COUNTDOWN] {successful_downloads} successful PDF(s); "
-            f"next cache/cookie cleanup in {remaining} successful PDF(s).",
+            f"next {cleanup_label} cleanup in {remaining} successful PDF(s).",
             flush=True,
         )
         return False
 
+    cleanup_action = (
+        "Clearing Chrome cache and cookies now..."
+        if CLEAR_COOKIES_WITH_CACHE
+        else "Clearing Chrome cache only; cookies will be preserved..."
+    )
     print(
         "\n============================================================\n"
         f"[CLEANUP START] {successful_downloads} successful PDFs reached.\n"
-        "Clearing Chrome cache and cookies now...\n"
+        f"{cleanup_action}\n"
         "============================================================",
         flush=True,
     )
     cleared = clear_browser_cache()
     if cleared:
+        completion_message = (
+            "[CLEANUP COMPLETE] CHROME CACHE AND COOKIES WERE CLEARED.\n"
+            "Chrome was reopened; sign in again if required."
+            if CLEAR_COOKIES_WITH_CACHE
+            else "[CLEANUP COMPLETE] CHROME CACHE WAS CLEARED.\n"
+            "Cookies were preserved and Chrome stayed open."
+        )
         print(
             "============================================================\n"
-            "[CLEANUP COMPLETE] CHROME CACHE AND COOKIES WERE CLEARED.\n"
-            "Chrome was reopened; sign in again if required.\n"
+            f"{completion_message}\n"
             "============================================================\n",
             flush=True,
         )
@@ -1224,6 +1364,9 @@ def main() -> int:
     if AUTO_CLEAR_BROWSER_CACHE and CACHE_CLEAR_EVERY_FILES <= 0:
         print("CACHE_CLEAR_EVERY_FILES must be > 0 when cache cleanup is enabled")
         return 1
+    if DOWNLOAD_BREAK_EVERY_FILES <= 0 or DOWNLOAD_BREAK_SECONDS < 0:
+        print("Download break interval must be > 0 and duration must be >= 0")
+        return 1
     if not INPUT_CSV.exists():
         print(f"Input CSV not found: {INPUT_CSV}")
         return 1
@@ -1271,11 +1414,19 @@ def main() -> int:
     print(f"[WATCH] {WATCH_DIR}")
     print(f"[OUT]   {OUTPUT_DIR}")
     if AUTO_CLEAR_BROWSER_CACHE:
+        cleanup_contents = (
+            "cache and cookies" if CLEAR_COOKIES_WITH_CACHE else "cache only"
+        )
         print(
-            f"[CLEANUP SCHEDULE] Cache and cookies clear after every "
+            f"[CLEANUP SCHEDULE] Chrome {cleanup_contents} clears after every "
             f"{CACHE_CLEAR_EVERY_FILES} successful new PDFs "
             f"(Chrome profile: {CHROME_PROFILE_DIRECTORY})."
         )
+    print(
+        f"[DOWNLOAD BREAK] Close ScienceDirect tabs and wait "
+        f"{DOWNLOAD_BREAK_SECONDS}s after every {DOWNLOAD_BREAK_EVERY_FILES} "
+        "successful new PDFs."
+    )
 
     successful_downloads = 0
 
@@ -1376,8 +1527,16 @@ def main() -> int:
                     output_path=str(destination),
                 )
                 write_csv_rows(OUTPUT_CSV, fieldnames, rows)
+                if CLOSE_COMPLETED_AUTOMATIC_TABS and strategy.automatic:
+                    close_completed_automatic_tab(url)
                 successful_downloads += 1
+                if (
+                    CLOSE_SCIENCEDIRECT_TABS_AT_BREAK
+                    and download_break_is_due(successful_downloads)
+                ):
+                    close_sciencedirect_tabs()
                 maybe_clear_browser_cache(successful_downloads)
+                wait_for_scheduled_download_break(successful_downloads)
                 break
 
             print("  [TIMEOUT] no download detected")
