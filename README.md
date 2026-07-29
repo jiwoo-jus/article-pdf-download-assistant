@@ -15,12 +15,14 @@ This tool does not bypass paywalls. It only works for articles you can already
 access in your browser. Use normal, authorized OSU Library access and respect
 publisher download limits and terms.
 
+You will need Google Chrome on macOS for automatic publisher clicks, tab management, and cache/cookie cleanup.
+
 ---
 
 ## 1. Install Requirements
 
-Python 3.9 or newer is recommended. The browser downloader uses only the Python
-standard library. The metadata script requires `requests`:
+- Python 3.10 or newer
+- The metadata script requires `requests`:
 
 ```bash
 python -m pip install requests
@@ -34,7 +36,7 @@ python -m pip install requests
 
 `ncbi_api_key` is optional but recommended.
 
-Create `config.yaml` from `config.template.yaml` and fill in your information.
+Replace the example values in your information.
 
 ---
 
@@ -185,9 +187,7 @@ In Chrome, enable:
 View > Developer > Allow JavaScript from Apple Events
 ```
 
-The first automation attempt may also trigger a macOS permission prompt. Allow
-the terminal application running Python to control Google Chrome. This can be
-reviewed later under:
+Allow the terminal application running Python to control Chrome under:
 
 ```text
 System Settings > Privacy & Security > Automation
@@ -212,143 +212,54 @@ AUTOMATE_PUBLISHER_PDF_CLICK = False
 Run:
 
 ```bash
-python download_browser_pdfs_original2.py
+python download_browser_pdfs.py
 ```
 
-The selected batch is reordered into two tiers.
+For each queued row, the script:
 
-### Tier 1: verified automatic patterns
+1. Reuses a valid existing `browser/{pmid}.pdf`, if present.
+2. Chooses an institutional override, an existing `download_url`, a known DOI
+   route, or a URL resolved through `doi.org`.
+3. Applies configured blocked/manual URL rules.
+4. Sorts verified automatic routes ahead of manual-review routes.
+5. Opens the URL and attempts a supported publisher click sequence when
+   applicable.
+6. Watches `~/Downloads` for a new or changed file.
+7. Accepts only a file of at least 1,024 bytes containing a PDF signature in
+   its first 1,024 bytes.
+8. Moves the file to `browser/{pmid}.pdf`.
+9. Updates `target_records.csv` after each final result.
 
-The script attempts these first:
+Avoid downloading unrelated PDFs while the script is waiting: it detects the
+newest qualifying PDF and cannot independently prove that it belongs to the
+current article.
 
-- ScienceDirect. ACS, Wiley, and other tested publisher click rules: SAGE, RSC, 
-Taylor & Francis, Oxford Academic, IOPscience, IIAR Journals, AACR Journals, JAMA Network
-- Recognizable direct PDF URLs
+### Skip or retry
 
-### Tier 2: possible manual review
+While waiting on macOS or Linux, enter `s` and press `Enter` to skip the current
+record. On Windows, press `s`.
 
-The remaining records open after the automatic tier. These include EBSCO institutional viewers, 
-unknown publisher layouts, access prompts, and pages whose PDF controls could not be identified safely. 
-Complete the OSU login or click the PDF/download controls while the script waits.
+The default wait is 600 seconds. After a timeout, an interactive run prompts you
+to retry with `r`; any other response records a timeout failure.
 
-For each target row, the script then:
+## URL preparation and ordering
 
-1. Read the PMID and DOI from `target_records.csv`
-2. Select an institutional override, existing `download_url`, predictable DOI
-   route, or resolved DOI URL
-3. Process verified automatic patterns before manual-review records
-4. Wait for a PDF download
-5. Let you manually complete login or click PDF/Download when needed
-6. Verify that the downloaded content has a PDF signature
-7. Move and rename it as:
+URL selection uses this order:
 
-```text
-browser/{pmid}.pdf
-```
+1. `INSTITUTIONAL_URL_OVERRIDES`
+2. An HTTP/HTTPS URL already stored in `download_url`
+3. A known DOI-prefix route
+4. A `HEAD` request to `doi.org`, followed by publisher-specific URL rewriting
+5. The original `doi.org` URL if resolution fails
 
-For example:
-
-```text
-browser/37313651.pdf
-```
-
-8. Update `target_records.csv` with the download status and output path
-
-During each record, the terminal will show:
-
-```text
-[WAIT] 600s | press 's' + Enter to skip
-```
-
-On Windows, press `s` to skip the current record. On macOS and Linux, press
-`s` and Enter.
-
-If no file is detected before the timeout, the script will let you retry or skip.
-
----
-
-## 8. Output
-
-Downloaded PDFs are saved in:
-
-```text
-browser/
-```
-
-Example:
-
-```text
-browser/37313651.pdf
-browser/18523888.pdf
-```
-
-Each row in `target_records.csv` will receive one of these statuses:
-
-```text
-pending
-success
-skipped
-failed
-```
-
-`pending` means that a row is queued or the process stopped before its final
-result was recorded. `fetch_source` distinguishes browser attempts, existing
-files, validation failures, and configured skip rules.
-
-The script automatically skips rows that already have a valid PDF at:
-
-```text
-browser/{pmid}.pdf
-```
-
----
-
-## 9. Batch Settings (optional)
-
-You can adjust these constants near the top of
-`download_browser_pdfs_original2.py`:
+The default blocked rule is:
 
 ```python
-BATCH_START = 0
-BATCH_LIMIT = 1000
-WAIT_TIMEOUT_SECONDS = 600
-OPEN_DELAY_SECONDS = 0.5
-AUTOMATE_PUBLISHER_PDF_CLICK = True
-AUTO_CLEAR_BROWSER_CACHE = True
-CACHE_CLEAR_EVERY_FILES = 10
-CLEAR_COOKIES_WITH_CACHE = False
-DOWNLOAD_BREAK_EVERY_FILES = 10
-DOWNLOAD_BREAK_SECONDS = 60
-CLOSE_COMPLETED_AUTOMATIC_TABS = True
-CLOSE_SCIENCEDIRECT_TABS_AT_BREAK = True
-CHROME_PROFILE_DIRECTORY = "Default"
-
 BLOCKED_URL_PATTERNS = ["karger.com"]
-MANUAL_URL_PATTERNS = ["link.springer.com"]
 ```
 
-With automatic cleanup enabled, the downloader removes Chrome's cached web
-files after every configured number of newly downloaded PDFs. Cookie deletion
-is disabled by default, so Chrome stays open and browser login sessions are
-preserved. If `CLEAR_COOKIES_WITH_CACHE` is changed to `True`, cleanup briefly
-quits Chrome, removes the cookie database, and reopens Chrome. Browsing history
-and saved passwords are not removed. If Chrome uses a different profile, set
-`CHROME_PROFILE_DIRECTORY` to its directory name, such as `"Profile 1"`.
-
-Completed automatic article tabs are closed after their PDF is detected. After
-every 10 successful new downloads, any remaining ScienceDirect tabs are closed,
-cache cleanup runs, and the downloader waits 60 seconds before opening the next
-record. Tabs for unrelated websites are not closed.
-
-`BLOCKED_URL_PATTERNS` uses case-insensitive substring matching against the final
-download URL. Add or remove domains or URL fragments freely. Set it to `[]` to
-disable this feature:
-
-```python
-BLOCKED_URL_PATTERNS = []
-```
-
-A matching row is not opened in the browser. Its CSV result records:
+Matching is a case-insensitive substring search. A matching row is not opened
+and is recorded as:
 
 ```text
 fetch_status: skipped
@@ -356,144 +267,294 @@ fetch_source: skip_rule
 fetch_error: blocked_url_pattern:karger.com
 ```
 
-The matched URL remains available in `download_url`.
-
-`MANUAL_URL_PATTERNS` uses the same case-insensitive substring matching, but a
-matching row is not skipped. It is moved into the manual-review tier, opened
-after the automatic tier, and left for you to complete any login or PDF click.
-Set it to `[]` if every recognized URL should use its normal automatic strategy:
+The default manual-review rule is:
 
 ```python
-MANUAL_URL_PATTERNS = []
+MANUAL_URL_PATTERNS = ["link.springer.com"]
 ```
 
-Some OSU institutional viewer URLs cannot be derived from a DOI because they
-contain an opaque database record ID. Configure those explicitly:
+A manual-rule match remains queued but is processed after automatic routes.
 
-```python
-INSTITUTIONAL_URL_OVERRIDES = {
-    "10.xxxx/example": "https://institutional-viewer.example/path",
-}
-```
+Known automatic click rules currently cover:
 
-The selected source batch is sorted into automatic and manual-review tiers after
-URL preparation. Ordering inside the same publisher group remains stable.
+- ScienceDirect
+- ACS
+- Wiley
+- SAGE
+- RSC
+- Taylor & Francis
+- Oxford Academic
+- IOPscience
+- IIAR Journals
+- AACR Journals
+- JAMA Network
 
-Examples:
+Recognizable direct-PDF URLs are also placed in the automatic tier. EBSCO
+institutional viewer URLs and unknown publisher layouts remain in the
+manual-review tier. Stable CSV ordering is preserved within the same priority.
 
-```python
-# First 25 records
-BATCH_START = 0
-BATCH_LIMIT = 25
+## Output
 
-# Next 25 records
-BATCH_START = 25
-BATCH_LIMIT = 25
-
-# Longer timeout
-WAIT_TIMEOUT_SECONDS = 900
-```
-
----
-
-## 10. Troubleshooting
-
-### Browser opens a page but nothing downloads
-
-Try the following:
-
-* Complete any OSU or publisher login prompt.
-* Accept necessary cookies and reject optional cookies if a consent alert blocks
-  the page.
-* Click the PDF or Download button manually.
-* Confirm Chrome downloads to the watched Downloads folder.
-* Confirm Chrome is configured to download PDFs instead of displaying them.
-* On macOS, confirm **Allow JavaScript from Apple Events** and the Automation
-  permission are enabled.
-* Press `r` to retry after a timeout, or `s` and Enter to skip.
-
-### Chrome says the automatic click is blocked
-
-Confirm this Chrome option is checked:
+PDFs are stored as:
 
 ```text
-View > Developer > Allow JavaScript from Apple Events
+browser/{pmid}.pdf
 ```
 
-Then check macOS **System Settings > Privacy & Security > Automation** and allow
-the terminal application to control Chrome. Restart Chrome and retry one record.
+The script adds missing result columns to `target_records.csv`:
 
-### Login or cookie prompt repeats
+```text
+fetch_status
+fetch_source
+fetch_error
+download_started_at
+download_finished_at
+download_filename
+download_url
+output_path
+```
 
-Use a normal Chrome window, not Incognito. Save the publisher's necessary-cookie
-preference, allow essential cookies for the OSU proxy and publisher, and sign in
-again. Optional advertising and analytics cookies are not required by this tool.
+Possible statuses are:
 
-### Wrong file was moved
+- `pending`: queued, but no final result has been written yet
+- `success`: a new or existing valid PDF is available
+- `skipped`: a duplicate, blocked URL, or manual skip
+- `failed`: validation, timeout, or ScienceDirect recovery failure
 
-The downloader validates PDF content, but it still cannot know whether an
-unrelated PDF belongs to the active article. Avoid downloading other PDFs while
-the script is waiting.
+CSV updates are written through a temporary file and atomically replace the
+original CSV.
 
-### If ScienceDirect reports “There was a problem providing the content”
+## Configuration
 
-An error page containing a reference number, IP address, user agent, and
-timestamp usually means ScienceDirect has temporarily blocked that IP after
-detecting unusual activity. [Elsevier says these blocks are automatically
-released and that programmatic ScienceDirect website access is not
-permitted](https://service.elsevier.com/app/answers/detail/a_id/10117/supporthub/sciencedirect/).
+Configuration is currently done by editing constants near the top of
+`download_browser_pdfs.py`.
 
-1. Stop processing ScienceDirect records and avoid repeated retries.
-2. Save a screenshot plus the reference number, IP address, and timestamp.
-3. Wait and try a single article manually later.
+### Paths and files
 
-If the problem appears to be a stale browser session rather than an IP block,
-clear only ScienceDirect and OSU-proxy site data through Chrome's privacy/site
-settings, restart Chrome, and sign in through OSU again. Chrome's built-in site
-data controls are preferred. If using a cache-cleaning extension, use a trusted
-extension with the narrowest permissions possible.
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PROJECT_ROOT` | Directory containing the script | Base directory used to derive project-relative paths. |
+| `INPUT_CSV` | `PROJECT_ROOT / "target_records.csv"` | CSV read at startup. |
+| `OUTPUT_CSV` | `INPUT_CSV` | CSV replaced with updated rows. Set a different path to preserve the input file. |
+| `WATCH_DIR` | `Path.home() / "Downloads"` | Directory polled for newly completed browser downloads. |
+| `OUTPUT_DIR` | `PROJECT_ROOT / "browser"` | Destination for PDFs renamed as `{pmid}.pdf`. |
+| `BATCH_LOG_PATH` | `None` | Optional JSON Lines event log. Set to a `Path`; `None` disables event logging. |
 
-Changing browsers can help diagnose a browser-local cache or profile problem,
-but it does not remove a server-side IP block. Do not change devices, networks,
-or IP addresses to bypass a publisher restriction.
+All four path constants are resolved to absolute paths by the script.
 
-### If ScienceDirect reports a daily download maximum
+### CSV schema variables
 
-Stop ScienceDirect downloads for the day and follow the limit displayed by the
-site. Elsevier currently documents multiple-download limits of 100 documents per
-day from search results and 250 per day from a journal issue page in its
-[download guidance](https://service.elsevier.com/app/answers/detail/a_id/10538/supporthub/sciencedirect/).
-Limits and individual-download rules can change. Wait for the permitted reset
-window or contact OSU Library/Elsevier Support if access is needed for a
-legitimate larger research workflow. Do not attempt to evade the limit by
-switching IP addresses, networks, or laptops.
+These constants define column names. Change them only if the input/output CSV
+uses a different schema.
 
----
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PMID_COLUMN` | `"pmid"` | Column containing the PubMed ID and source of the output filename. |
+| `DOI_COLUMN` | `"doi"` | Column containing a DOI, DOI URL, or article URL. |
+| `IS_FETCH_TARGET_COLUMN` | `"is_fetch_target"` | Optional row-selection column. |
+| `TARGET_ENABLED_VALUE` | `"Y"` | Selection marker, matched case-insensitively after trimming whitespace. |
+| `FETCH_STATUS_COLUMN` | `"fetch_status"` | Final or pending state of the row. |
+| `FETCH_SOURCE_COLUMN` | `"fetch_source"` | Component that produced the result. |
+| `FETCH_ERROR_COLUMN` | `"fetch_error"` | Machine-readable failure or skip reason. |
+| `DOWNLOAD_STARTED_AT_COLUMN` | `"download_started_at"` | Local ISO-8601 timestamp recorded before opening the URL. |
+| `DOWNLOAD_FINISHED_AT_COLUMN` | `"download_finished_at"` | Local ISO-8601 timestamp recorded when the attempt finishes. |
+| `DOWNLOAD_FILENAME_COLUMN` | `"download_filename"` | Final basename, normally `{pmid}.pdf`. |
+| `DOWNLOAD_URL_COLUMN` | `"download_url"` | Prepared URL used for the attempt. An existing HTTP/HTTPS value is reused on later runs. |
+| `OUTPUT_PATH_COLUMN` | `"output_path"` | Absolute path of a successfully stored PDF. |
+| `DOWNLOAD_RESULT_FIELDS` | The eight result columns above | Internal ordered list of result columns added when missing. |
 
-## 11. Authorized Manual Retrieval
+### Batch and download controls
 
-For skipped or unavailable records, use the DOI with one of these authorized
-routes:
+| Variable | Default | Meaning and valid values |
+| --- | --- | --- |
+| `BATCH_START` | `0` | Zero-based offset into eligible records. Must be `>= 0`. |
+| `BATCH_LIMIT` | `1000` | Maximum eligible records selected. Must be `> 0`. |
+| `OPEN_DELAY_SECONDS` | `0.5` | Pause after initiating a URL open. Non-negative seconds are expected. |
+| `WAIT_TIMEOUT_SECONDS` | `600` | Maximum seconds to wait for a PDF before prompting/failing. Must be `> 0`. |
+| `POLL_INTERVAL_SECONDS` | `1.0` | Delay between scans of `WATCH_DIR`. Must be `> 0`. |
+| `MIN_FILE_SIZE_BYTES` | `1024` | Minimum accepted PDF size in bytes. |
+| `INTERACTIVE_SKIP` | `True` | `True` enables keyboard skipping and the retry prompt; `False` turns a timeout directly into failure. |
+| `DRY_RUN` | `False` | `True` prepares/displays the queue without opening URLs, moving PDFs, or writing CSV changes. |
+| `OPEN_COMMAND` | `None` | Optional command string used instead of Chrome automation/default-browser opening, such as `"open -a Safari"`. `None` uses normal behavior. |
+| `BLOCKED_URL_PATTERNS` | `["karger.com"]` | Case-insensitive URL substrings that cause a row to be recorded as skipped. Use `[]` to disable. |
+| `MANUAL_URL_PATTERNS` | `["link.springer.com"]` | Case-insensitive URL substrings forced into the manual-review tier. Use `[]` to disable. |
+| `AUTOMATE_PUBLISHER_PDF_CLICK` | `True` | Enables supported Chrome/AppleScript publisher clicks. |
+| `PUBLISHER_CLICK_TIMEOUT_SECONDS` | `20` | Maximum publisher automation window in seconds. |
+| `CLOSE_COMPLETED_AUTOMATIC_TABS` | `True` | Closes the active automated tab after its PDF is detected, if the tab still matches the expected host. |
 
-* OSU Library catalog, journal search, or **Find It at OSU**
-* The publisher page while signed in through OSU
-* PubMed Central or another legitimate open-access repository
-* OSU interlibrary loan/document delivery
+### Cleanup, breaks, and recovery
 
-After downloading manually, place the verified PDF at `browser/{pmid}.pdf`. The
-next run will recognize it as an existing result.
+| Variable | Default | Meaning and valid values |
+| --- | --- | --- |
+| `AUTO_CLEAR_BROWSER_CACHE` | `True` | Enables scheduled Chrome cleanup after successful downloads. |
+| `CACHE_CLEAR_EVERY_FILES` | `12` | Successful-download interval for cleanup. Must be `> 0` while automatic cleanup is enabled. |
+| `CLEAR_COOKIES_WITH_CACHE` | `True` | `True` also closes Chrome and deletes the configured profile's complete cookie databases; `False` preserves cookies. |
+| `DOWNLOAD_BREAK_EVERY_FILES` | `100` | Successful-download interval for the scheduled break. Must be `> 0`. |
+| `DOWNLOAD_BREAK_SECONDS` | `60` | Break duration and ScienceDirect recovery delay. Must be `>= 0`. |
+| `SCIENCEDIRECT_REQUEST_ERROR_MAX_RETRIES` | `3` | Maximum cleanup/retry cycles for one detected ScienceDirect request error. Must be `>= 0`; `0` disables recovery retries. |
+| `CLOSE_SCIENCEDIRECT_TABS_AT_BREAK` | `True` | Closes ScienceDirect tabs whenever the download-break interval is reached. |
+| `CHROME_PROFILE_DIRECTORY` | `"Default"` | Final directory name of the Chrome profile targeted by cleanup, for example `"Profile 1"`. |
 
----
+### Derived Chrome paths
 
-## 12. Most features are available only on macOS + Chrome.
+These values are built from `CHROME_PROFILE_DIRECTORY` for macOS. Normally,
+change the profile variable rather than editing these derived paths.
 
-- Automatic publisher clicks: Google Chrome on macOS only.
-- Automatic tab closing: Google Chrome on macOS only.
-- Cache/cookie cleanup: Google Chrome’s configured profile only.
-- Download detection, PDF validation, renaming, and CSV updates: work with any browser downloading into the watched Downloads folder.
-- Other browsers fall back to manual page interaction.
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `CHROME_CACHE_ROOT` | `~/Library/Caches/Google/Chrome` | Root of Chrome's macOS cache data. |
+| `CHROME_USER_DATA_ROOT` | `~/Library/Application Support/Google/Chrome` | Root of Chrome's macOS profile data. |
+| `CHROME_CACHE_DIRECTORIES` | `<profile>/Cache`, `<profile>/Code Cache` | Directory contents removed by cache cleanup. |
+| `CHROME_PROFILE_ROOT` | `CHROME_USER_DATA_ROOT / CHROME_PROFILE_DIRECTORY` | Selected Chrome profile directory. |
+| `CHROME_COOKIE_DATABASES` | `<profile>/Cookies`, `<profile>/Network/Cookies` | Complete cookie databases targeted when cookie cleanup is enabled. |
+| `CHROME_COOKIE_FILES` | Each cookie database plus `-journal`, `-wal`, and `-shm` | Exact database/companion files deleted during cookie cleanup. |
 
-To use Safari, Edge, or Firefox safely, set:
+### Routing and priority variables
+
+Lower numeric priorities run first. Sorting is stable, so CSV order is
+preserved among rows with the same priority.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `AUTO_PUBLISHER_PRIORITY` | ScienceDirect `0`; ACS `10`; Wiley `20`; SAGE `30`; RSC `40`; Taylor & Francis `50`; Oxford Academic `60`; IOPscience `70`; IIAR Journals `80`; AACR Journals `90`; JAMA Network `100` | Processing order for verified publisher click rules. |
+| `DIRECT_PDF_PRIORITY` | `200` | Priority for recognizable direct-PDF URLs. |
+| `MANUAL_REVIEW_PRIORITY` | `1000` | Priority for configured manual patterns, EBSCO viewers, and unknown layouts. |
+| `INSTITUTIONAL_URL_OVERRIDES` | One DOI-to-OSU-EBSCO mapping | Exact DOI-to-URL mappings for opaque institutional viewer URLs. Use `{}` when no overrides are needed. |
+| `TEMP_SUFFIXES` | `{".crdownload", ".part", ".download", ".tmp"}` | Files and companion files treated as incomplete downloads. |
+| `DOI_PREFIX_RULES` | Rules for `10.3390`, `10.1007`, `10.1038`, `10.1002`, `10.1111`, `10.1096`, `10.1021`, `10.3389`, `10.1073`, `10.1126`, `10.1128`, `10.1177`, `10.1089`, `10.1080`, and `10.1088` | Ordered DOI-prefix-to-publisher URL templates checked before resolving through `doi.org`. |
+
+### Publisher endpoint variables
+
+These are internal URL-building defaults, not ordinary runtime switches.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `SCIENCEDIRECT_PROXY_HOST` | `www-sciencedirect-com.proxy.lib.ohio-state.edu` | OSU ScienceDirect proxy host recognized by routing and click rules. |
+| `SCIENCEDIRECT_ARTICLE_BASE_URL` | ScienceDirect proxy `/science/article/pii` URL | Base URL used when rewriting Elsevier PII links. |
+| `ACS_PROXY_HOST` | `pubs-acs-org.proxy.lib.ohio-state.edu` | OSU ACS proxy host. |
+| `ACS_ARTICLE_BASE_URL` | ACS proxy `/doi/full` URL | Base URL used for ACS DOI routes. |
+| `WILEY_PROXY_HOST` | `onlinelibrary-wiley-com.proxy.lib.ohio-state.edu` | OSU Wiley proxy host. |
+| `WILEY_ARTICLE_BASE_URL` | Wiley proxy `/doi/full` URL | Base URL used for Wiley DOI routes. |
+| `SAGE_PROXY_HOST` | `journals-sagepub-com.proxy.lib.ohio-state.edu` | OSU SAGE proxy host. |
+| `SAGE_ARTICLE_BASE_URL` | SAGE proxy `/doi/full` URL | Base URL used for SAGE DOI routes. |
+| `LIEBERT_ARTICLE_BASE_URL` | `https://www.liebertpub.com/doi/pdf` | Public Liebert PDF base URL. |
+| `TANDF_PROXY_HOST` | `www-tandfonline-com.proxy.lib.ohio-state.edu` | OSU Taylor & Francis proxy host. |
+| `TANDF_ARTICLE_BASE_URL` | Taylor & Francis proxy `/doi/full` URL | Base URL used for Taylor & Francis DOI routes. |
+
+## Enum and state reference
+
+### `PublisherOpenStatus`
+
+This is the only Python `Enum` defined by the script.
+
+| Enum member | String value | Meaning |
+| --- | --- | --- |
+| `PublisherOpenStatus.OPENED` | `"opened"` | The URL opened or an automatic PDF click was initiated successfully. |
+| `PublisherOpenStatus.REQUEST_BLOCKED` | `"request_blocked"` | The configured ScienceDirect request-error page was detected; recovery may run. |
+| `PublisherOpenStatus.AUTOMATION_FAILED` | `"automation_failed"` | Chrome automation was unavailable or failed; `open_url()` falls back to the default browser. |
+
+### CSV state values
+
+These are strings written to the CSV, not Python Enums.
+
+| Field | Available values | Meaning |
+| --- | --- | --- |
+| `fetch_status` | `pending`, `success`, `skipped`, `failed` | Lifecycle/result state described in the Output section. |
+| `fetch_source` | `browser`, `existing`, `validation`, `skip_rule` | Browser attempt, pre-existing PDF, input validation, or blocked-pattern rule. |
+| `fetch_error` | Empty, `invalid_pmid`, `invalid_doi`, `duplicate_pmid`, `manually_skipped`, `timeout`, `blocked_url_pattern:<pattern>`, `sciencedirect_request_error_retries_exhausted`, `sciencedirect_request_error_cleanup_failed` | Machine-readable reason; empty means no error was recorded. |
+
+### Internal record fields
+
+| Type | Field | Meaning |
+| --- | --- | --- |
+| `PublisherClickRule` | `publisher` | Human-readable publisher label and priority-map key. |
+| `PublisherClickRule` | `pdf_selector` | CSS selector used for the first PDF/viewer click. |
+| `PublisherClickRule` | `download_selector` | Optional CSS selector for a second-stage download link. |
+| `PublisherClickRule` | `reveal_download_selector` | Optional selector that opens a download menu. |
+| `PublisherClickRule` | `dismiss_selector` | Optional popup-dismiss selector. |
+| `PublisherClickRule` | `request_error_selector` | Optional selector for a publisher error message. |
+| `PublisherClickRule` | `request_error_text` | Text required within the selected error element. |
+| `FileSnapshot` | `size` | Observed file size in bytes. |
+| `FileSnapshot` | `modified_ns` | File modification timestamp in nanoseconds. |
+| `DownloadStrategy` | `priority` | Numeric queue-order priority. |
+| `DownloadStrategy` | `automatic` | Whether the route is treated as automatic. |
+| `DownloadStrategy` | `label` | Publisher or manual-route description printed to the terminal. |
+
+`BATCH_START` and `BATCH_LIMIT` select from eligible records after validation
+and existing-file checks. The selected records are then reordered by download
+strategy.
+
+Set `BATCH_LOG_PATH` to a `Path` to append JSON Lines event records. Set
+`OPEN_COMMAND` to a command string to use a custom URL opener; doing so bypasses
+the Chrome publisher-click automation.
+
+Set `DRY_RUN = True` to prepare and display the queue without opening URLs,
+moving downloads, or writing CSV results. The script can still resolve DOI URLs
+over the network and create the configured watch/output directories.
+
+## Scheduled breaks and Chrome cleanup
+
+After every 12 successful new downloads by default, the script:
+
+1. Closes remaining ScienceDirect tabs, if enabled.
+2. Clears Chrome cache and cookies, if enabled.
+3. Waits 60 seconds before continuing.
+
+Cache cleanup targets the configured Chrome profile's `Cache` and `Code Cache`
+directories.
+
+Important: with `CLEAR_COOKIES_WITH_CACHE = True`, Chrome is closed and the
+script deletes the configured profile's complete `Cookies` and
+`Network/Cookies` database files, including journal/WAL/SHM companions. This
+logs the profile out of websites; it does not preserve other
+sessions selectively. Chrome is reopened if it was running.
+
+To preserve all cookies during scheduled cleanup:
+
+```python
+CLEAR_COOKIES_WITH_CACHE = False
+```
+
+But to avoid scienceDirect's too many request error, you need to clear cookies regualry.
+
+To disable scheduled cache cleanup entirely:
+
+```python
+AUTO_CLEAR_BROWSER_CACHE = False
+```
+
+## ScienceDirect request-error recovery
+
+The ScienceDirect rule detects an error page containing:
+
+```text
+There was a problem providing the content you requested
+```
+
+When detected, the script:
+
+1. Closes ScienceDirect tabs.
+2. Stops Chrome.
+3. Clears the configured profile's cache and complete cookie database.
+4. Restarts Chrome.
+5. Waits `DOWNLOAD_BREAK_SECONDS`.
+6. Retries the same article.
+
+Recovery is attempted at most
+`SCIENCEDIRECT_REQUEST_ERROR_MAX_RETRIES` times. The row is marked failed if
+retries are exhausted or cleanup/restart does not fully complete.
+
+Because recovery clears all cookies, be prepared to sign in through OSU again.
+Local cleanup also cannot remove a server-side publisher or IP restriction. Do
+not use other devices, networks, or addresses to evade publisher limits.
+
+## Other operating systems and browsers
+
+Download detection, PDF validation, renaming, and CSV updates can work with any
+browser that downloads into `WATCH_DIR`. Automatic publisher clicks, tab
+closing, and the configured Chrome cleanup paths are macOS-specific.
+
+For another operating system or browser, use:
 
 ```python
 AUTOMATE_PUBLISHER_PDF_CLICK = False
@@ -502,4 +563,44 @@ CLOSE_COMPLETED_AUTOMATIC_TABS = False
 CLOSE_SCIENCEDIRECT_TABS_AT_BREAK = False
 ```
 
-The 60-second break still works independently of the browser.
+The scheduled download break works independently of browser automation.
+
+## Troubleshooting
+
+### A page opens but nothing downloads
+
+- Complete any institutional or publisher login prompt.
+- Dismiss a consent dialog that covers the PDF control.
+- Click the PDF or Download control manually.
+- Confirm that the browser downloads into `WATCH_DIR`.
+- Confirm that PDFs download instead of opening in the browser viewer.
+- On macOS, verify Chrome's Apple Events setting and Automation permission.
+
+### The automatic click is blocked
+
+Enable:
+
+```text
+View > Developer > Allow JavaScript from Apple Events
+```
+
+Then check the terminal application's macOS Automation permission, restart
+Chrome, and retry.
+
+### The wrong PDF was moved
+
+Do not download other PDFs while a record is waiting. If necessary, move the
+incorrect file out of `browser/`, download the correct PDF manually as
+`browser/{pmid}.pdf`, and rerun the script.
+
+### Chrome uses a different profile
+
+Open `chrome://version` and inspect **Profile Path**. Set
+`CHROME_PROFILE_DIRECTORY` to its final directory name, such as `"Profile 1"`.
+
+### Manual retrieval
+
+For unavailable records, retrieve the article through an authorized source such
+as OSU Library, the publisher, PubMed Central, or interlibrary loan. Save the
+verified file as `browser/{pmid}.pdf`; the next run will recognize it as an
+existing result.

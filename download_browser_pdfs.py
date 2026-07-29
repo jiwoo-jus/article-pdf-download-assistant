@@ -1,18 +1,3 @@
-'''
-Cookie deletion is now disabled and the previous setting is commented out:
-# CLEAR_COOKIES_WITH_CACHE = True
-CLEAR_COOKIES_WITH_CACHE = False
-
-New behavior:
-Closes each completed automatic article tab.
-After every 10 successful downloads:Closes remaining ScienceDirect tabs.
-Clears cache while preserving cookies.
-Waits 60 seconds.
-Prints when the break begins and ends.
-Leaves unrelated personal tabs open.
-All 24 tests pass. This may reduce browser/session buildup, but it cannot guarantee prevention of an Elsevier server-side IP block.
-'''
-
 from __future__ import annotations
 
 import csv
@@ -27,6 +12,7 @@ import time
 import webbrowser
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Iterable, Mapping
 from urllib.error import HTTPError, URLError
@@ -35,9 +21,6 @@ from urllib.request import Request, urlopen
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-
-BROWSER_PDF_DIR = (PROJECT_ROOT / "browser").resolve()
-BROWSER_WATCH_DIR = (Path.home() / "Downloads").resolve()
 
 PMID_COLUMN = "pmid"
 DOI_COLUMN = "doi"
@@ -63,8 +46,6 @@ DOWNLOAD_RESULT_FIELDS = [
     OUTPUT_PATH_COLUMN,
 ]
 
-EXISTING_PDF_DIRECTORIES = (BROWSER_PDF_DIR,)
-
 
 @dataclass(frozen=True)
 class PublisherClickRule:
@@ -72,6 +53,9 @@ class PublisherClickRule:
     pdf_selector: str
     download_selector: str | None = None
     reveal_download_selector: str | None = None
+    dismiss_selector: str | None = None
+    request_error_selector: str | None = None
+    request_error_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +69,12 @@ class DownloadStrategy:
     priority: int
     automatic: bool
     label: str
+
+
+class PublisherOpenStatus(Enum):
+    OPENED = "opened"
+    REQUEST_BLOCKED = "request_blocked"
+    AUTOMATION_FAILED = "automation_failed"
 
 
 def ensure_directory(path: Path) -> None:
@@ -163,12 +153,12 @@ def write_csv_rows(path: Path, fieldnames: list[str], rows: list[dict[str, str]]
 
 INPUT_CSV = (PROJECT_ROOT / "target_records.csv").resolve()
 OUTPUT_CSV = INPUT_CSV
-WATCH_DIR = BROWSER_WATCH_DIR
-OUTPUT_DIR = BROWSER_PDF_DIR
+WATCH_DIR = (Path.home() / "Downloads").resolve()
+OUTPUT_DIR = (PROJECT_ROOT / "browser").resolve()
 
 BATCH_START = 0
 BATCH_LIMIT = 1000
-OPEN_DELAY_SECONDS = 0.5
+OPEN_DELAY_SECONDS = 0.3
 WAIT_TIMEOUT_SECONDS = 600
 POLL_INTERVAL_SECONDS = 1.0
 MIN_FILE_SIZE_BYTES = 1024
@@ -183,12 +173,11 @@ MANUAL_URL_PATTERNS = ["link.springer.com"]
 AUTOMATE_PUBLISHER_PDF_CLICK = True
 PUBLISHER_CLICK_TIMEOUT_SECONDS = 20
 AUTO_CLEAR_BROWSER_CACHE = True
-CACHE_CLEAR_EVERY_FILES = 10
-# Set to True only if scheduled cleanup should also sign out browser sessions.
-# CLEAR_COOKIES_WITH_CACHE = True
-CLEAR_COOKIES_WITH_CACHE = False
-DOWNLOAD_BREAK_EVERY_FILES = 10
+CACHE_CLEAR_EVERY_FILES = 12
+CLEAR_COOKIES_WITH_CACHE = True
+DOWNLOAD_BREAK_EVERY_FILES = 100
 DOWNLOAD_BREAK_SECONDS = 60
+SCIENCEDIRECT_REQUEST_ERROR_MAX_RETRIES = 3
 CLOSE_COMPLETED_AUTOMATIC_TABS = True
 CLOSE_SCIENCEDIRECT_TABS_AT_BREAK = True
 CHROME_PROFILE_DIRECTORY = "Default"
@@ -745,16 +734,23 @@ def wait_for_scheduled_download_break(successful_downloads: int) -> bool:
     return True
 
 
-def clear_browser_cache() -> bool:
-    """Clear Chrome disk caches and, when enabled, its cookie database."""
+def clear_browser_cache(
+    *,
+    clear_cookies: bool | None = None,
+    restart_chrome: bool = False,
+) -> bool:
+    """Clear Chrome caches and optionally force cookie cleanup and a restart."""
     found_directory = False
     removed_entries = 0
     removed_cookie_files = 0
     errors: list[str] = []
+    should_clear_cookies = (
+        CLEAR_COOKIES_WITH_CACHE if clear_cookies is None else clear_cookies
+    )
 
     chrome_stopped = True
     chrome_was_running = False
-    if CLEAR_COOKIES_WITH_CACHE:
+    if should_clear_cookies:
         chrome_stopped, chrome_was_running = stop_chrome_for_cookie_cleanup()
         if not chrome_stopped:
             errors.append("Chrome could not be stopped; cookies were not cleared")
@@ -782,7 +778,7 @@ def clear_browser_cache() -> bool:
             except OSError as exc:
                 errors.append(f"{entry}: {exc}")
 
-    if CLEAR_COOKIES_WITH_CACHE and chrome_stopped:
+    if should_clear_cookies and chrome_stopped:
         for cookie_file in CHROME_COOKIE_FILES:
             try:
                 cookie_file.unlink()
@@ -792,7 +788,13 @@ def clear_browser_cache() -> bool:
             except OSError as exc:
                 errors.append(f"{cookie_file}: {exc}")
 
-    if chrome_was_running and chrome_stopped and not reopen_chrome():
+    should_reopen_chrome = chrome_was_running or restart_chrome
+    if (
+        should_clear_cookies
+        and chrome_stopped
+        and should_reopen_chrome
+        and not reopen_chrome()
+    ):
         errors.append("Chrome could not be reopened after cookie cleanup")
 
     cleared_at = now_timestamp()
@@ -809,7 +811,7 @@ def clear_browser_cache() -> bool:
             flush=True,
         )
 
-    if CLEAR_COOKIES_WITH_CACHE:
+    if should_clear_cookies:
         if not chrome_stopped:
             print("  [COOKIE CLEAR] SKIPPED because Chrome did not close.", flush=True)
         elif removed_cookie_files:
@@ -839,6 +841,8 @@ def clear_browser_cache() -> bool:
             "profile": CHROME_PROFILE_DIRECTORY,
             "removed_entries": removed_entries,
             "removed_cookie_files": removed_cookie_files,
+            "cookies_requested": should_clear_cookies,
+            "restart_requested": restart_chrome,
             "errors": errors,
             "finished_at": cleared_at,
         }
@@ -902,6 +906,53 @@ def maybe_clear_browser_cache(successful_downloads: int) -> bool:
     return cleared
 
 
+def recover_from_sciencedirect_request_error(
+    *,
+    pmid: str,
+    url: str,
+    retry_number: int,
+) -> bool:
+    """Reset Chrome after ScienceDirect rejects a request, ready for a retry."""
+    print(
+        "\n============================================================\n"
+        "[SCIENCEDIRECT REQUEST ERROR]\n"
+        "Closing ScienceDirect tabs, clearing Chrome cache and cookies, "
+        "and restarting Chrome.\n"
+        f"The current article will be retried ({retry_number}/"
+        f"{SCIENCEDIRECT_REQUEST_ERROR_MAX_RETRIES}).\n"
+        "============================================================",
+        flush=True,
+    )
+    log_event(
+        {
+            "event": "sciencedirect_request_error_recovery",
+            "pmid": pmid,
+            "url": url,
+            "retry_number": retry_number,
+            "started_at": now_timestamp(),
+        }
+    )
+
+    close_sciencedirect_tabs()
+    cleared = clear_browser_cache(clear_cookies=True, restart_chrome=True)
+    if not cleared:
+        print(
+            "  [RECOVERY FAILED] Chrome cleanup/restart did not fully complete.",
+            flush=True,
+        )
+        return False
+
+    if DOWNLOAD_BREAK_SECONDS > 0:
+        print(
+            f"  [RECOVERY WAIT] Waiting {DOWNLOAD_BREAK_SECONDS}s before "
+            "retrying the same article.",
+            flush=True,
+        )
+        time.sleep(DOWNLOAD_BREAK_SECONDS)
+    print("  [RECOVERY RETRY] Reopening the same ScienceDirect article.", flush=True)
+    return True
+
+
 def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
     host = (urlparse(url).hostname or "").casefold()
     if host.endswith("sciencedirect.com") or host == SCIENCEDIRECT_PROXY_HOST:
@@ -909,6 +960,14 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
             publisher="ScienceDirect",
             pdf_selector=(
                 'a[aria-label^="View PDF"][href*="/pdfft"], a[href*="/pdfft"]'
+            ),
+            dismiss_selector=(
+                '#pendo-base button._pendo-close-guide[aria-label="Close"], '
+                'button[id^="pendo-close-guide-"][aria-label="Close"]'
+            ),
+            request_error_selector=".error-card .card-content h1.u-h2",
+            request_error_text=(
+                "There was a problem providing the content you requested"
             ),
         )
     if host in ("pubs.acs.org", ACS_PROXY_HOST):
@@ -1086,16 +1145,44 @@ def open_publisher_and_click_pdf(
     selector: str,
     download_selector: str | None,
     reveal_download_selector: str | None,
-) -> bool:
+    dismiss_selector: str | None = None,
+    request_error_selector: str | None = None,
+    request_error_text: str | None = None,
+) -> PublisherOpenStatus:
     """Open a publisher article and click through to its final PDF download."""
     if sys.platform != "darwin" or not shutil.which("osascript"):
-        return False
+        return PublisherOpenStatus.AUTOMATION_FAILED
 
     attempts = max(1, int(PUBLISHER_CLICK_TIMEOUT_SECONDS / 0.5))
-    javascript = """
+    javascript = r"""
 (() => {
   const downloadSelector = __DOWNLOAD_SELECTOR__;
   const revealDownloadSelector = __REVEAL_DOWNLOAD_SELECTOR__;
+  const dismissSelector = __DISMISS_SELECTOR__;
+  const requestErrorSelector = __REQUEST_ERROR_SELECTOR__;
+  const requestErrorText = __REQUEST_ERROR_TEXT__;
+  if (requestErrorSelector && requestErrorText) {
+    const requestError = document.querySelector(requestErrorSelector);
+    const normalizedErrorText = requestError?.textContent
+      ?.replace(/\s+/g, ' ')
+      .trim();
+    if (normalizedErrorText?.includes(requestErrorText)) {
+      return 'request_blocked';
+    }
+  }
+
+  if (dismissSelector) {
+    const dismissButton = document.querySelector(dismissSelector);
+    if (
+      dismissButton &&
+      dismissButton.dataset.automatedDismissClick !== 'true'
+    ) {
+      dismissButton.dataset.automatedDismissClick = 'true';
+      dismissButton.click();
+      return 'popup_dismissed';
+    }
+  }
+
   if (downloadSelector) {
     const downloadLink = document.querySelector(downloadSelector);
     if (downloadLink) {
@@ -1120,12 +1207,21 @@ def open_publisher_and_click_pdf(
   link.dataset.automatedPdfClick = 'true';
   link.target = '_self';
   link.click();
+  if (requestErrorSelector && requestErrorText) {
+    return 'download_clicked_monitoring';
+  }
   return downloadSelector ? 'pdf_page_opened' : 'download_clicked';
 })()
 """.replace(
         "__DOWNLOAD_SELECTOR__", json.dumps(download_selector)
     ).replace(
         "__REVEAL_DOWNLOAD_SELECTOR__", json.dumps(reveal_download_selector)
+    ).replace(
+        "__DISMISS_SELECTOR__", json.dumps(dismiss_selector)
+    ).replace(
+        "__REQUEST_ERROR_SELECTOR__", json.dumps(request_error_selector)
+    ).replace(
+        "__REQUEST_ERROR_TEXT__", json.dumps(request_error_text)
     ).replace(
         "__PDF_SELECTOR__", json.dumps(selector)
     ).strip()
@@ -1139,15 +1235,31 @@ on run argv
         set articleTab to make new tab at end of tabs of front window with properties {{URL:targetUrl}}
         set active tab index of front window to (count of tabs of front window)
         set pdfPageOpened to false
+        set popupDismissed to false
+        set monitoredDownloadChecksRemaining to 0
         set lastJavaScriptError to ""
 
         repeat {attempts} times
             delay 0.5
             try
                 set clickResult to execute articleTab javascript clickScript
-                if clickResult is "download_clicked" then return "download_clicked"
+                if clickResult is "request_blocked" then return "request_blocked"
+                if clickResult is "download_clicked" then
+                    if popupDismissed then return "download_clicked_after_popup"
+                    return "download_clicked"
+                end if
+                if clickResult is "download_clicked_monitoring" then
+                    set monitoredDownloadChecksRemaining to 20
+                else if monitoredDownloadChecksRemaining > 0 then
+                    set monitoredDownloadChecksRemaining to monitoredDownloadChecksRemaining - 1
+                    if monitoredDownloadChecksRemaining is 0 then
+                        if popupDismissed then return "download_clicked_after_popup"
+                        return "download_clicked"
+                    end if
+                end if
                 if clickResult is "pdf_page_opened" then set pdfPageOpened to true
                 if clickResult is "download_menu_opened" then set pdfPageOpened to true
+                if clickResult is "popup_dismissed" then set popupDismissed to true
             on error errorMessage
                 set lastJavaScriptError to errorMessage
             end try
@@ -1170,60 +1282,71 @@ end run
         )
     except subprocess.TimeoutExpired:
         print(f"  [AUTO-PDF] {publisher} automation timed out")
-        return False
+        return PublisherOpenStatus.AUTOMATION_FAILED
     except OSError as exc:
         print(f"  [AUTO-PDF] Chrome automation unavailable: {exc}")
-        return False
+        return PublisherOpenStatus.AUTOMATION_FAILED
 
     status = result.stdout.strip()
-    if status == "download_clicked":
+    if status == "request_blocked":
+        print(
+            f"  [AUTO-PDF] detected {publisher} request-limit error page",
+            flush=True,
+        )
+        return PublisherOpenStatus.REQUEST_BLOCKED
+
+    if status in {"download_clicked", "download_clicked_after_popup"}:
+        if status == "download_clicked_after_popup":
+            print(f"  [AUTO-PDF] dismissed {publisher} popup")
         print(f"  [AUTO-PDF] clicked {publisher} PDF download")
-        return True
+        return PublisherOpenStatus.OPENED
 
     if status.startswith("javascript_error:"):
         print("  [AUTO-PDF] article opened, but Chrome blocked the automatic click")
         print("  [AUTO-PDF] enable View > Developer > Allow JavaScript from Apple Events")
-        return True
+        return PublisherOpenStatus.OPENED
 
     if status == "view_pdf_not_found":
         print(f"  [AUTO-PDF] {publisher} PDF link was not found; article left open")
-        return True
+        return PublisherOpenStatus.OPENED
 
     if status == "download_link_not_found":
         print(f"  [AUTO-PDF] {publisher} PDF opened, but its download link was not found")
-        return True
+        return PublisherOpenStatus.OPENED
 
     error = result.stderr.strip() or status or f"osascript exited {result.returncode}"
     print(f"  [AUTO-PDF] Chrome automation failed: {error}")
-    return False
+    return PublisherOpenStatus.AUTOMATION_FAILED
 
 
-def open_url(url: str) -> None:
+def open_url(url: str) -> PublisherOpenStatus:
     if OPEN_COMMAND:
         subprocess.run([*shlex.split(OPEN_COMMAND), url], check=False)
-        return
+        return PublisherOpenStatus.OPENED
 
     if AUTOMATE_PUBLISHER_PDF_CLICK and download_strategy(url).automatic:
         click_rule = publisher_pdf_click_rule(url)
         if click_rule:
-            if open_publisher_and_click_pdf(
+            open_status = open_publisher_and_click_pdf(
                 url,
                 click_rule.publisher,
                 click_rule.pdf_selector,
                 click_rule.download_selector,
                 click_rule.reveal_download_selector,
-            ):
-                return
+                click_rule.dismiss_selector,
+                click_rule.request_error_selector,
+                click_rule.request_error_text,
+            )
+            if open_status is not PublisherOpenStatus.AUTOMATION_FAILED:
+                return open_status
 
     webbrowser.open_new_tab(url)
+    return PublisherOpenStatus.OPENED
 
 
 def existing_pdf_path(pmid: str) -> Path | None:
-    for directory in EXISTING_PDF_DIRECTORIES:
-        candidate = directory / f"{pmid}.pdf"
-        if candidate.is_file() and is_pdf_file(candidate):
-            return candidate
-    return None
+    candidate = OUTPUT_DIR / f"{pmid}.pdf"
+    return candidate if candidate.is_file() and is_pdf_file(candidate) else None
 
 
 def now_timestamp() -> str:
@@ -1367,6 +1490,9 @@ def main() -> int:
     if DOWNLOAD_BREAK_EVERY_FILES <= 0 or DOWNLOAD_BREAK_SECONDS < 0:
         print("Download break interval must be > 0 and duration must be >= 0")
         return 1
+    if SCIENCEDIRECT_REQUEST_ERROR_MAX_RETRIES < 0:
+        print("SCIENCEDIRECT_REQUEST_ERROR_MAX_RETRIES must be >= 0")
+        return 1
     if not INPUT_CSV.exists():
         print(f"Input CSV not found: {INPUT_CSV}")
         return 1
@@ -1461,11 +1587,64 @@ def main() -> int:
         started_at = now_timestamp()
         log_event({"event": "open", "pmid": pmid, "url": url, "started_at": started_at})
 
+        request_error_failure = ""
         if not DRY_RUN:
-            open_url(url)
-            time.sleep(OPEN_DELAY_SECONDS)
+            request_error_retries = 0
+            while True:
+                open_status = open_url(url)
+                time.sleep(OPEN_DELAY_SECONDS)
+                if open_status is not PublisherOpenStatus.REQUEST_BLOCKED:
+                    break
+
+                if (
+                    request_error_retries
+                    >= SCIENCEDIRECT_REQUEST_ERROR_MAX_RETRIES
+                ):
+                    request_error_failure = (
+                        "sciencedirect_request_error_retries_exhausted"
+                    )
+                    break
+
+                request_error_retries += 1
+                if not recover_from_sciencedirect_request_error(
+                    pmid=pmid,
+                    url=url,
+                    retry_number=request_error_retries,
+                ):
+                    request_error_failure = (
+                        "sciencedirect_request_error_cleanup_failed"
+                    )
+                    break
 
         if DRY_RUN:
+            continue
+
+        if request_error_failure:
+            finished_at = now_timestamp()
+            print(
+                "  [FAILED] ScienceDirect request-error recovery stopped: "
+                f"{request_error_failure}",
+                flush=True,
+            )
+            log_event(
+                {
+                    "event": "failed",
+                    "pmid": pmid,
+                    "url": url,
+                    "reason": request_error_failure,
+                    "started_at": started_at,
+                    "finished_at": finished_at,
+                }
+            )
+            write_result(
+                row,
+                status="failed",
+                error=request_error_failure,
+                started_at=started_at,
+                finished_at=finished_at,
+                url=url,
+            )
+            write_csv_rows(OUTPUT_CSV, fieldnames, rows)
             continue
 
         while True:
