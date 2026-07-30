@@ -157,10 +157,10 @@ WATCH_DIR = (Path.home() / "Downloads").resolve()
 OUTPUT_DIR = (PROJECT_ROOT / "browser").resolve()
 
 BATCH_START = 0
-BATCH_LIMIT = 1000
-OPEN_DELAY_SECONDS = 0.3
+BATCH_LIMIT = 2000
+OPEN_DELAY_SECONDS = 0.4
 WAIT_TIMEOUT_SECONDS = 600
-POLL_INTERVAL_SECONDS = 1.0
+POLL_INTERVAL_SECONDS = 0.3
 MIN_FILE_SIZE_BYTES = 1024
 INTERACTIVE_SKIP = True
 DRY_RUN = False
@@ -174,8 +174,9 @@ AUTOMATE_PUBLISHER_PDF_CLICK = True
 PUBLISHER_CLICK_TIMEOUT_SECONDS = 20
 AUTO_CLEAR_BROWSER_CACHE = True
 CACHE_CLEAR_EVERY_FILES = 12
+CACHE_CLEAR_PUBLISHERS = ["ScienceDirect"]
 CLEAR_COOKIES_WITH_CACHE = True
-DOWNLOAD_BREAK_EVERY_FILES = 100
+DOWNLOAD_BREAK_EVERY_FILES = 2000
 DOWNLOAD_BREAK_SECONDS = 60
 SCIENCEDIRECT_REQUEST_ERROR_MAX_RETRIES = 3
 CLOSE_COMPLETED_AUTOMATIC_TABS = True
@@ -850,9 +851,20 @@ def clear_browser_cache(
     return not errors
 
 
-def maybe_clear_browser_cache(successful_downloads: int) -> bool:
-    """Clear cache at each configured successful-download interval."""
+def publisher_uses_scheduled_cleanup(publisher: str) -> bool:
+    """Return whether successful downloads from a publisher count toward cleanup."""
+    return publisher in CACHE_CLEAR_PUBLISHERS
+
+
+def maybe_clear_browser_cache(
+    successful_downloads: int,
+    *,
+    publisher: str,
+) -> bool:
+    """Clear cache at each eligible-publisher successful-download interval."""
     if not AUTO_CLEAR_BROWSER_CACHE or CACHE_CLEAR_EVERY_FILES <= 0:
+        return False
+    if not publisher_uses_scheduled_cleanup(publisher):
         return False
     if successful_downloads <= 0:
         return False
@@ -862,7 +874,8 @@ def maybe_clear_browser_cache(successful_downloads: int) -> bool:
         remaining = CACHE_CLEAR_EVERY_FILES - completed_in_cycle
         cleanup_label = "cache/cookie" if CLEAR_COOKIES_WITH_CACHE else "cache"
         print(
-            f"  [CLEANUP COUNTDOWN] {successful_downloads} successful PDF(s); "
+            f"  [CLEANUP COUNTDOWN] {successful_downloads} successful "
+            f"{publisher} PDF(s); "
             f"next {cleanup_label} cleanup in {remaining} successful PDF(s).",
             flush=True,
         )
@@ -875,7 +888,8 @@ def maybe_clear_browser_cache(successful_downloads: int) -> bool:
     )
     print(
         "\n============================================================\n"
-        f"[CLEANUP START] {successful_downloads} successful PDFs reached.\n"
+        f"[CLEANUP START] {successful_downloads} successful {publisher} "
+        "PDFs reached.\n"
         f"{cleanup_action}\n"
         "============================================================",
         flush=True,
@@ -1543,9 +1557,11 @@ def main() -> int:
         cleanup_contents = (
             "cache and cookies" if CLEAR_COOKIES_WITH_CACHE else "cache only"
         )
+        cleanup_publishers = ", ".join(CACHE_CLEAR_PUBLISHERS) or "none"
         print(
             f"[CLEANUP SCHEDULE] Chrome {cleanup_contents} clears after every "
-            f"{CACHE_CLEAR_EVERY_FILES} successful new PDFs "
+            f"{CACHE_CLEAR_EVERY_FILES} successful new PDFs from: "
+            f"{cleanup_publishers} "
             f"(Chrome profile: {CHROME_PROFILE_DIRECTORY})."
         )
     print(
@@ -1555,6 +1571,7 @@ def main() -> int:
     )
 
     successful_downloads = 0
+    successful_cleanup_downloads_by_publisher: dict[str, int] = {}
 
     for position, row in enumerate(queue, start=1):
         pmid = normalize_pmid(row.get(PMID_COLUMN))
@@ -1714,7 +1731,21 @@ def main() -> int:
                     and download_break_is_due(successful_downloads)
                 ):
                     close_sciencedirect_tabs()
-                maybe_clear_browser_cache(successful_downloads)
+                if publisher_uses_scheduled_cleanup(strategy.label):
+                    publisher_successes = (
+                        successful_cleanup_downloads_by_publisher.get(
+                            strategy.label,
+                            0,
+                        )
+                        + 1
+                    )
+                    successful_cleanup_downloads_by_publisher[strategy.label] = (
+                        publisher_successes
+                    )
+                    maybe_clear_browser_cache(
+                        publisher_successes,
+                        publisher=strategy.label,
+                    )
                 wait_for_scheduled_download_break(successful_downloads)
                 break
 

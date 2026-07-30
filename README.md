@@ -368,10 +368,10 @@ uses a different schema.
 | Variable | Default | Meaning and valid values |
 | --- | --- | --- |
 | `BATCH_START` | `0` | Zero-based offset into eligible records. Must be `>= 0`. |
-| `BATCH_LIMIT` | `1000` | Maximum eligible records selected. Must be `> 0`. |
-| `OPEN_DELAY_SECONDS` | `0.5` | Pause after initiating a URL open. Non-negative seconds are expected. |
+| `BATCH_LIMIT` | `2000` | Maximum eligible records selected. Must be `> 0`. |
+| `OPEN_DELAY_SECONDS` | `0.4` | Pause after initiating a URL open. Non-negative seconds are expected. |
 | `WAIT_TIMEOUT_SECONDS` | `600` | Maximum seconds to wait for a PDF before prompting/failing. Must be `> 0`. |
-| `POLL_INTERVAL_SECONDS` | `1.0` | Delay between scans of `WATCH_DIR`. Must be `> 0`. |
+| `POLL_INTERVAL_SECONDS` | `0.3` | Delay between scans of `WATCH_DIR`. Must be `> 0`. |
 | `MIN_FILE_SIZE_BYTES` | `1024` | Minimum accepted PDF size in bytes. |
 | `INTERACTIVE_SKIP` | `True` | `True` enables keyboard skipping and the retry prompt; `False` turns a timeout directly into failure. |
 | `DRY_RUN` | `False` | `True` prepares/displays the queue without opening URLs, moving PDFs, or writing CSV changes. |
@@ -387,9 +387,10 @@ uses a different schema.
 | Variable | Default | Meaning and valid values |
 | --- | --- | --- |
 | `AUTO_CLEAR_BROWSER_CACHE` | `True` | Enables scheduled Chrome cleanup after successful downloads. |
-| `CACHE_CLEAR_EVERY_FILES` | `12` | Successful-download interval for cleanup. Must be `> 0` while automatic cleanup is enabled. |
+| `CACHE_CLEAR_EVERY_FILES` | `12` | Eligible-publisher successful-download interval for cleanup. Must be `> 0` while automatic cleanup is enabled. |
+| `CACHE_CLEAR_PUBLISHERS` | `["ScienceDirect"]` | Publisher labels whose successful new downloads count toward and can trigger scheduled cleanup. Other publishers do not trigger cache or cookie cleanup. |
 | `CLEAR_COOKIES_WITH_CACHE` | `True` | `True` also closes Chrome and deletes the configured profile's complete cookie databases; `False` preserves cookies. |
-| `DOWNLOAD_BREAK_EVERY_FILES` | `100` | Successful-download interval for the scheduled break. Must be `> 0`. |
+| `DOWNLOAD_BREAK_EVERY_FILES` | `1000` | Successful-download interval for the scheduled break. Must be `> 0`. |
 | `DOWNLOAD_BREAK_SECONDS` | `60` | Break duration and ScienceDirect recovery delay. Must be `>= 0`. |
 | `SCIENCEDIRECT_REQUEST_ERROR_MAX_RETRIES` | `3` | Maximum cleanup/retry cycles for one detected ScienceDirect request error. Must be `>= 0`; `0` disables recovery retries. |
 | `CLOSE_SCIENCEDIRECT_TABS_AT_BREAK` | `True` | Closes ScienceDirect tabs whenever the download-break interval is reached. |
@@ -494,11 +495,15 @@ over the network and create the configured watch/output directories.
 
 ## Scheduled breaks and Chrome cleanup
 
-After every 12 successful new downloads by default, the script:
+After every `CACHE_CLEAR_EVERY_FILES` successful new ScienceDirect downloads by default, the script:
 
-1. Closes remaining ScienceDirect tabs, if enabled.
-2. Clears Chrome cache and cookies, if enabled.
-3. Waits 60 seconds before continuing.
+1. Clears Chrome cache and cookies, if enabled.
+2. Continues with the next record.
+
+Successful downloads from publishers not listed in `CACHE_CLEAR_PUBLISHERS` do
+not count toward this interval and never trigger scheduled cache/cookie cleanup.
+The separate `DOWNLOAD_BREAK_EVERY_FILES`-file download-break counter still includes successful new PDFs
+from every publisher.
 
 Cache cleanup targets the configured Chrome profile's `Cache` and `Code Cache`
 directories.
@@ -515,7 +520,8 @@ To preserve all cookies during scheduled cleanup:
 CLEAR_COOKIES_WITH_CACHE = False
 ```
 
-But to avoid scienceDirect's too many request error, you need to clear cookies regualry.
+ScienceDirect may still require regular cookie cleanup when it reports too many
+requests.
 
 To disable scheduled cache cleanup entirely:
 
