@@ -16,7 +16,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterable, Mapping
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, unquote, urlparse, urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -96,7 +96,10 @@ def normalize_doi(value: str | None) -> str:
     if cleaned.casefold().startswith("doi:"):
         cleaned = cleaned[4:].strip()
 
-    parsed = urlparse(cleaned)
+    # urlparse() treats the semicolon suffix in legacy Wiley DOIs such as
+    # ``...3.0.CO;2-4`` as URL parameters and removes it from ``path``.
+    # urlsplit() keeps the complete DOI path intact.
+    parsed = urlsplit(cleaned)
     host = (parsed.hostname or "").casefold()
     if parsed.scheme.casefold() in {"http", "https"} and host in {
         "doi.org",
@@ -109,6 +112,14 @@ def normalize_doi(value: str | None) -> str:
 def is_http_url(value: str) -> bool:
     parsed = urlparse(value)
     return parsed.scheme.casefold() in {"http", "https"} and bool(parsed.netloc)
+
+
+def is_doi_resolver_url(value: str) -> bool:
+    parsed = urlsplit(value)
+    return (
+        parsed.scheme.casefold() in {"http", "https"}
+        and (parsed.hostname or "").casefold() in {"doi.org", "dx.doi.org"}
+    )
 
 
 def encoded_doi(doi: str) -> str:
@@ -158,9 +169,14 @@ OUTPUT_DIR = (PROJECT_ROOT / "browser").resolve()
 
 BATCH_START = 0
 BATCH_LIMIT = 2000
-OPEN_DELAY_SECONDS = 0.4
+# Rebuild each queued row's download_url from its DOI instead of reusing the
+# value already stored in the CSV.  This can repair stale or incomplete URLs
+# and retry DOI resolution after a transient failure.  Set to False when the
+# saved download_url values are known to be good.
+OVERRIDE_EXISTING_DOWNLOAD_URLS = False
+OPEN_DELAY_SECONDS = 0.5
 WAIT_TIMEOUT_SECONDS = 600
-POLL_INTERVAL_SECONDS = 0.3
+POLL_INTERVAL_SECONDS = 0.5
 MIN_FILE_SIZE_BYTES = 1024
 INTERACTIVE_SKIP = True
 DRY_RUN = False
@@ -205,10 +221,10 @@ CHROME_COOKIE_FILES = tuple(
 # publisher group, while all verified automatic routes stay ahead of records
 # that need manual review.
 AUTO_PUBLISHER_PRIORITY = {
-    "ScienceDirect": 0,
+    "ScienceDirect": 101,
     "ACS": 10,
     "Wiley": 20,
-    "SAGE": 30,
+    "SAGE": 102,
     "RSC": 40,
     "Taylor & Francis": 50,
     "Oxford Academic": 60,
@@ -321,7 +337,9 @@ def doi_from_doi_path(path: str) -> str:
 
 
 def rewrite_resolved_url(url: str) -> str:
-    parsed = urlparse(url)
+    # Keep legacy DOI semicolon suffixes in the path.  With urlparse(), a DOI
+    # ending in ``.CO;2-X`` is exposed as path ``.CO`` plus params ``2-X``.
+    parsed = urlsplit(url)
     host = (parsed.hostname or "").casefold()
     path = parsed.path
     doi = doi_from_doi_path(path)
@@ -411,23 +429,55 @@ def resolve_best_pdf_url(doi: str, resolve_timeout: float = 8.0) -> str:
             return template.format(doi=encoded_doi(doi))
 
     doi_url = f"https://doi.org/{encoded_doi(doi)}"
-    try:
-        request = Request(
-            doi_url,
-            method="HEAD",
-            headers={"User-Agent": "Mozilla/5.0 (browser-pdf-fetch/2.0)"},
+    errors: list[str] = []
+    resolved = ""
+    resolved_method = ""
+    for method in ("HEAD", "GET"):
+        try:
+            request = Request(
+                doi_url,
+                method=method,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (browser-pdf-fetch/2.0)",
+                    "Accept": "text/html,application/xhtml+xml",
+                },
+            )
+            with urlopen(request, timeout=resolve_timeout) as response:
+                resolved = response.geturl()
+            resolved_method = method
+            break
+        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            errors.append(f"{method} {describe_resolution_error(exc)}")
+
+    if not resolved:
+        print(
+            f"  [RESOLVE FALLBACK] {'; '.join(errors)}; "
+            f"using {doi_url}"
         )
-        with urlopen(request, timeout=resolve_timeout) as response:
-            resolved = response.geturl()
-        print(f"  [RESOLVE] {doi_url} -> {resolved}")
-    except (HTTPError, URLError, TimeoutError, OSError) as exc:
-        print(f"  [RESOLVE] failed ({exc}), falling back to doi.org URL")
         return doi_url
 
+    print(f"  [RESOLVE {resolved_method}] {doi_url} -> {resolved}")
     rewritten = rewrite_resolved_url(resolved)
     if rewritten != resolved:
         print(f"  [REWRITE] -> {rewritten}")
     return rewritten
+
+
+def describe_resolution_error(exc: Exception) -> str:
+    """Return a concise, single-line explanation for DOI lookup failures."""
+    if isinstance(exc, HTTPError):
+        if exc.code == 403:
+            return "HTTP 403 (automated lookup refused)"
+        if 300 <= exc.code < 400:
+            return f"HTTP {exc.code} (redirect loop or rejected redirect)"
+        return f"HTTP {exc.code} ({exc.reason})"
+    if isinstance(exc, TimeoutError):
+        return "timed out"
+    if isinstance(exc, URLError):
+        reason = " ".join(str(exc.reason).split())
+        return f"network error ({reason})"
+    message = " ".join(str(exc).split())
+    return f"{type(exc).__name__} ({message})"
 
 
 def matching_blocked_pattern(url: str) -> str:
@@ -1453,23 +1503,75 @@ def build_queue(
         eligible.append((row, pmid, doi))
 
     selected = eligible[BATCH_START:BATCH_START + BATCH_LIMIT]
+    selected_count = len(selected)
+    print(
+        f"[URL PREP] selected={selected_count} eligible={len(eligible)} "
+        f"start={BATCH_START} limit={BATCH_LIMIT} "
+        f"override_existing={OVERRIDE_EXISTING_DOWNLOAD_URLS}"
+    )
+
     queue: list[dict[str, str]] = []
-    for row, pmid, doi in selected:
+    action_counts: dict[str, int] = {}
+    blocked_count = 0
+    for index, (row, pmid, doi) in enumerate(selected, start=1):
         existing_url = normalize_cell(row.get(DOWNLOAD_URL_COLUMN))
         override_url = institutional_url_override(doi)
         if override_url:
+            planned_action = "institutional override"
+        elif OVERRIDE_EXISTING_DOWNLOAD_URLS and existing_url:
+            planned_action = "refresh existing URL"
+        elif OVERRIDE_EXISTING_DOWNLOAD_URLS:
+            planned_action = "resolve DOI"
+        elif is_http_url(existing_url):
+            planned_action = "reuse existing URL"
+        else:
+            planned_action = "resolve DOI"
+        print(
+            f"[URL {index}/{selected_count}] pmid {pmid} | {planned_action}"
+        )
+
+        if override_url:
             url = override_url
+            action = "override"
             if url != existing_url:
                 print(f"  [OVERRIDE] doi={doi} -> {url}")
+        elif OVERRIDE_EXISTING_DOWNLOAD_URLS:
+            refreshed_url = resolve_best_pdf_url(doi)
+            refresh_failed = (
+                is_http_url(existing_url)
+                and not is_doi_resolver_url(existing_url)
+                and is_doi_resolver_url(refreshed_url)
+            )
+            if refresh_failed:
+                url = existing_url
+                action = "kept_after_refresh_failure"
+                print(
+                    "  [KEEP URL] DOI refresh returned only a fallback; "
+                    f"retaining {existing_url}"
+                )
+            else:
+                url = refreshed_url
+                action = (
+                    "doi_fallback"
+                    if is_doi_resolver_url(url)
+                    else "refreshed"
+                )
+            if existing_url and url != existing_url:
+                print(f"  [REFRESH URL] {existing_url} -> {url}")
         elif is_http_url(existing_url):
-            url = rewrite_resolved_url(existing_url)
-            if url != existing_url:
-                print(f"  [REWRITE] {existing_url} -> {url}")
+            url = existing_url
+            action = "reused"
         else:
             url = resolve_best_pdf_url(doi)
+            action = (
+                "doi_fallback" if is_doi_resolver_url(url) else "resolved"
+            )
+
+        action_counts[action] = action_counts.get(action, 0) + 1
 
         blocked_pattern = matching_blocked_pattern(url)
         if blocked_pattern:
+            blocked_count += 1
             print(f"  [SKIP URL] pmid={pmid} pattern={blocked_pattern} url={url}")
             write_result(
                 row,
@@ -1487,6 +1589,13 @@ def build_queue(
         key=lambda queued_row: download_strategy(
             normalize_cell(queued_row.get(DOWNLOAD_URL_COLUMN))
         ).priority
+    )
+    action_summary = " ".join(
+        f"{action}={count}" for action, count in sorted(action_counts.items())
+    )
+    print(
+        f"[URL PREP DONE] queued={len(queue)} blocked={blocked_count}"
+        + (f" | {action_summary}" if action_summary else "")
     )
     return queue
 

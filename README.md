@@ -218,8 +218,9 @@ python download_browser_pdfs.py
 For each queued row, the script:
 
 1. Reuses a valid existing `browser/{pmid}.pdf`, if present.
-2. Chooses an institutional override, an existing `download_url`, a known DOI
-   route, or a URL resolved through `doi.org`.
+2. Chooses an institutional override, refreshes or reuses `download_url`
+   according to `OVERRIDE_EXISTING_DOWNLOAD_URLS`, then uses a known DOI route
+   or resolves the DOI through `doi.org`.
 3. Applies configured blocked/manual URL rules.
 4. Sorts verified automatic routes ahead of manual-review routes.
 5. Opens the URL and attempts a supported publisher click sequence when
@@ -247,10 +248,42 @@ to retry with `r`; any other response records a timeout failure.
 URL selection uses this order:
 
 1. `INSTITUTIONAL_URL_OVERRIDES`
-2. An HTTP/HTTPS URL already stored in `download_url`
-3. A known DOI-prefix route
-4. A `HEAD` request to `doi.org`, followed by publisher-specific URL rewriting
-5. The original `doi.org` URL if resolution fails
+2. If `OVERRIDE_EXISTING_DOWNLOAD_URLS` is `True`, rebuild the URL from `doi`
+3. Otherwise, reuse an HTTP/HTTPS URL already stored in `download_url`
+4. A known DOI-prefix route
+5. A `HEAD` request to `doi.org`, followed by publisher-specific URL rewriting
+6. The original `doi.org` URL if resolution fails
+
+URL preparation reports its own progress before browser downloads begin:
+
+```text
+[URL PREP] selected=1431 eligible=1431 start=0 limit=2000 override_existing=True
+[URL 1/1431] pmid 42415230 | refresh existing URL
+...
+[URL PREP DONE] queued=1431 blocked=0 | refreshed=1200 reused=200 ...
+```
+
+The URL messages mean:
+
+- `RESOLVE HEAD` or `RESOLVE GET`: the DOI resolver successfully redirected to
+  a publisher. `GET` is tried when the lighter `HEAD` request fails.
+- `REWRITE`: a resolved article page was converted to the publisher's preferred
+  PDF or full-article route. This is not an error.
+- `REFRESH URL`: with `OVERRIDE_EXISTING_DOWNLOAD_URLS = True`, a newly prepared
+  URL replaced the saved value.
+- `KEEP URL`: refresh failed and returned only a generic DOI fallback, so the
+  existing publisher URL was preserved.
+- `RESOLVE FALLBACK`: both lookup methods failed. If no better existing URL is
+  available, the browser receives the `doi.org` URL and follows it interactively.
+
+Common resolver failures are `HTTP 403` (the publisher refused an automated
+lookup), `HTTP 302` (a redirect loop or rejected redirect), and timeout/network
+errors. They do not necessarily mean the article is unavailable. To avoid
+repeating resolver requests after URLs have been prepared, set:
+
+```python
+OVERRIDE_EXISTING_DOWNLOAD_URLS = False
+```
 
 The default blocked rule is:
 
@@ -359,7 +392,7 @@ uses a different schema.
 | `DOWNLOAD_STARTED_AT_COLUMN` | `"download_started_at"` | Local ISO-8601 timestamp recorded before opening the URL. |
 | `DOWNLOAD_FINISHED_AT_COLUMN` | `"download_finished_at"` | Local ISO-8601 timestamp recorded when the attempt finishes. |
 | `DOWNLOAD_FILENAME_COLUMN` | `"download_filename"` | Final basename, normally `{pmid}.pdf`. |
-| `DOWNLOAD_URL_COLUMN` | `"download_url"` | Prepared URL used for the attempt. An existing HTTP/HTTPS value is reused on later runs. |
+| `DOWNLOAD_URL_COLUMN` | `"download_url"` | Prepared URL used for the attempt. Existing values are refreshed or reused according to `OVERRIDE_EXISTING_DOWNLOAD_URLS`. |
 | `OUTPUT_PATH_COLUMN` | `"output_path"` | Absolute path of a successfully stored PDF. |
 | `DOWNLOAD_RESULT_FIELDS` | The eight result columns above | Internal ordered list of result columns added when missing. |
 
@@ -369,6 +402,7 @@ uses a different schema.
 | --- | --- | --- |
 | `BATCH_START` | `0` | Zero-based offset into eligible records. Must be `>= 0`. |
 | `BATCH_LIMIT` | `2000` | Maximum eligible records selected. Must be `> 0`. |
+| `OVERRIDE_EXISTING_DOWNLOAD_URLS` | `True` | `True` rebuilds each queued row's URL from `doi` and stores it in `download_url`; `False` reuses an existing HTTP/HTTPS `download_url` and only resolves rows without one. Institutional overrides always take precedence. |
 | `OPEN_DELAY_SECONDS` | `0.4` | Pause after initiating a URL open. Non-negative seconds are expected. |
 | `WAIT_TIMEOUT_SECONDS` | `600` | Maximum seconds to wait for a PDF before prompting/failing. Must be `> 0`. |
 | `POLL_INTERVAL_SECONDS` | `0.3` | Delay between scans of `WATCH_DIR`. Must be `> 0`. |
