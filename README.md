@@ -225,15 +225,18 @@ For each queued row, the script:
 4. Sorts verified automatic routes ahead of manual-review routes.
 5. Opens the URL and attempts a supported publisher click sequence when
    applicable.
-6. Watches `~/Downloads` for a new or changed file.
+6. Watches `~/Downloads` for a new or changed file. For ScienceDirect URLs,
+   it also checks that the downloaded filename contains the expected article
+   PII and ignores unrelated PDF downloads.
 7. Accepts only a file of at least 1,024 bytes containing a PDF signature in
    its first 1,024 bytes.
 8. Moves the file to `browser/{pmid}.pdf`.
 9. Updates `target_records.csv` after each final result.
 
-Avoid downloading unrelated PDFs while the script is waiting: it detects the
-newest qualifying PDF and cannot independently prove that it belongs to the
-current article.
+Avoid downloading unrelated PDFs while the script is waiting. ScienceDirect
+downloads are checked against the expected PII in the filename, but other
+publishers still use the newest qualifying PDF and cannot independently prove
+that it belongs to the current article.
 
 ### Skip or retry
 
@@ -248,10 +251,12 @@ to retry with `r`; any other response records a timeout failure.
 URL selection uses this order:
 
 1. `INSTITUTIONAL_URL_OVERRIDES`
-2. If `OVERRIDE_EXISTING_DOWNLOAD_URLS` is `True`, rebuild the URL from `doi`
+2. If `OVERRIDE_EXISTING_DOWNLOAD_URLS` is `True`, first try to repair the
+   existing URL using the row DOI; if no repair is needed, rebuild it from `doi`
 3. Otherwise, reuse an HTTP/HTTPS URL already stored in `download_url`
 4. A known DOI-prefix route
-5. A `HEAD` request to `doi.org`, followed by publisher-specific URL rewriting
+5. A `HEAD` request to `doi.org`, followed by `GET` when needed and
+   publisher-specific URL rewriting
 6. The original `doi.org` URL if resolution fails
 
 URL preparation reports its own progress before browser downloads begin:
@@ -269,6 +274,8 @@ The URL messages mean:
   a publisher. `GET` is tried when the lighter `HEAD` request fails.
 - `REWRITE`: a resolved article page was converted to the publisher's preferred
   PDF or full-article route. This is not an error.
+- `REPAIR URL`: an existing publisher URL was corrected locally using its DOI,
+  without another resolver request.
 - `REFRESH URL`: with `OVERRIDE_EXISTING_DOWNLOAD_URLS = True`, a newly prepared
   URL replaced the saved value.
 - `KEEP URL`: refresh failed and returned only a generic DOI fallback, so the
@@ -278,21 +285,32 @@ The URL messages mean:
 
 Common resolver failures are `HTTP 403` (the publisher refused an automated
 lookup), `HTTP 302` (a redirect loop or rejected redirect), and timeout/network
-errors. They do not necessarily mean the article is unavailable. To avoid
+errors. They do not necessarily mean the article is unavailable. The rewrite layer also
+repairs common cookie/error routes such as Literatum `cookieAbsent`,
+`crawlprevention/governor`, and `cookies_not_supported`, and preserves Wiley
+journal subdomains when constructing OSU proxy URLs. To avoid
 repeating resolver requests after URLs have been prepared, set:
 
 ```python
 OVERRIDE_EXISTING_DOWNLOAD_URLS = False
 ```
 
-The default blocked rule is:
+The default blocked rules are:
 
 ```python
-BLOCKED_URL_PATTERNS = ["karger.com"]
+BLOCKED_URL_PATTERNS = [
+    "karger.com",
+    "ashpublications.org",
+    "ascopubs.org",
+    "neurology.org",
+    "auajournals.org",
+    "10.1158",
+]
 ```
 
-Matching is a case-insensitive substring search. A matching row is not opened
-and is recorded as:
+Matching is a case-insensitive substring search. For unresolved `doi.org`
+URLs, configured DOI-prefix host hints are also checked, so known blocked
+publishers can be skipped before Chrome opens the redirect. A matching row is not opened and is recorded as:
 
 ```text
 fetch_status: skipped
@@ -312,6 +330,7 @@ Known automatic click rules currently cover:
 
 - ScienceDirect
 - ACS
+- ASCO Publications
 - Wiley
 - SAGE
 - RSC
@@ -321,6 +340,10 @@ Known automatic click rules currently cover:
 - IIAR Journals
 - AACR Journals
 - JAMA Network
+- NEJM
+- Ovid
+- AUA Journals
+- Nature
 
 Recognizable direct-PDF URLs are also placed in the automatic tier. EBSCO
 institutional viewer URLs and unknown publisher layouts remain in the
@@ -402,15 +425,15 @@ uses a different schema.
 | --- | --- | --- |
 | `BATCH_START` | `0` | Zero-based offset into eligible records. Must be `>= 0`. |
 | `BATCH_LIMIT` | `2000` | Maximum eligible records selected. Must be `> 0`. |
-| `OVERRIDE_EXISTING_DOWNLOAD_URLS` | `True` | `True` rebuilds each queued row's URL from `doi` and stores it in `download_url`; `False` reuses an existing HTTP/HTTPS `download_url` and only resolves rows without one. Institutional overrides always take precedence. |
-| `OPEN_DELAY_SECONDS` | `0.4` | Pause after initiating a URL open. Non-negative seconds are expected. |
+| `OVERRIDE_EXISTING_DOWNLOAD_URLS` | `False` | `True` rebuilds each queued row's URL from `doi` and stores it in `download_url`; `False` reuses an existing HTTP/HTTPS `download_url` and only resolves rows without one. Institutional overrides always take precedence. |
+| `OPEN_DELAY_SECONDS` | `1.5` | Pause after initiating a URL open. Non-negative seconds are expected. |
 | `WAIT_TIMEOUT_SECONDS` | `600` | Maximum seconds to wait for a PDF before prompting/failing. Must be `> 0`. |
-| `POLL_INTERVAL_SECONDS` | `0.3` | Delay between scans of `WATCH_DIR`. Must be `> 0`. |
+| `POLL_INTERVAL_SECONDS` | `1` | Delay between scans of `WATCH_DIR`. Must be `> 0`. |
 | `MIN_FILE_SIZE_BYTES` | `1024` | Minimum accepted PDF size in bytes. |
 | `INTERACTIVE_SKIP` | `True` | `True` enables keyboard skipping and the retry prompt; `False` turns a timeout directly into failure. |
 | `DRY_RUN` | `False` | `True` prepares/displays the queue without opening URLs, moving PDFs, or writing CSV changes. |
 | `OPEN_COMMAND` | `None` | Optional command string used instead of Chrome automation/default-browser opening, such as `"open -a Safari"`. `None` uses normal behavior. |
-| `BLOCKED_URL_PATTERNS` | `["karger.com"]` | Case-insensitive URL substrings that cause a row to be recorded as skipped. Use `[]` to disable. |
+| `BLOCKED_URL_PATTERNS` | `["karger.com", "ashpublications.org", "ascopubs.org", "neurology.org", "auajournals.org", "10.1158"]` | Case-insensitive URL substrings that cause a row to be recorded as skipped. Use `[]` to disable. |
 | `MANUAL_URL_PATTERNS` | `["link.springer.com"]` | Case-insensitive URL substrings forced into the manual-review tier. Use `[]` to disable. |
 | `AUTOMATE_PUBLISHER_PDF_CLICK` | `True` | Enables supported Chrome/AppleScript publisher clicks. |
 | `PUBLISHER_CLICK_TIMEOUT_SECONDS` | `20` | Maximum publisher automation window in seconds. |
@@ -424,7 +447,7 @@ uses a different schema.
 | `CACHE_CLEAR_EVERY_FILES` | `12` | Eligible-publisher successful-download interval for cleanup. Must be `> 0` while automatic cleanup is enabled. |
 | `CACHE_CLEAR_PUBLISHERS` | `["ScienceDirect"]` | Publisher labels whose successful new downloads count toward and can trigger scheduled cleanup. Other publishers do not trigger cache or cookie cleanup. |
 | `CLEAR_COOKIES_WITH_CACHE` | `True` | `True` also closes Chrome and deletes the configured profile's complete cookie databases; `False` preserves cookies. |
-| `DOWNLOAD_BREAK_EVERY_FILES` | `1000` | Successful-download interval for the scheduled break. Must be `> 0`. |
+| `DOWNLOAD_BREAK_EVERY_FILES` | `2000` | Successful-download interval for the scheduled break. Must be `> 0`. |
 | `DOWNLOAD_BREAK_SECONDS` | `60` | Break duration and ScienceDirect recovery delay. Must be `>= 0`. |
 | `SCIENCEDIRECT_REQUEST_ERROR_MAX_RETRIES` | `3` | Maximum cleanup/retry cycles for one detected ScienceDirect request error. Must be `>= 0`; `0` disables recovery retries. |
 | `CLOSE_SCIENCEDIRECT_TABS_AT_BREAK` | `True` | Closes ScienceDirect tabs whenever the download-break interval is reached. |
@@ -451,12 +474,13 @@ preserved among rows with the same priority.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `AUTO_PUBLISHER_PRIORITY` | ScienceDirect `0`; ACS `10`; Wiley `20`; SAGE `30`; RSC `40`; Taylor & Francis `50`; Oxford Academic `60`; IOPscience `70`; IIAR Journals `80`; AACR Journals `90`; JAMA Network `100` | Processing order for verified publisher click rules. |
+| `AUTO_PUBLISHER_PRIORITY` | ScienceDirect `0`; ACS `10`; ASCO Publications `25`; Wiley `27`; SAGE `30`; RSC `40`; Taylor & Francis `50`; Oxford Academic `60`; IOPscience `70`; IIAR Journals `80`; AACR Journals `90`; JAMA Network `100`; NEJM `105`; Ovid `110`; AUA Journals `115`; Nature `120` | Processing order for verified publisher click rules. |
 | `DIRECT_PDF_PRIORITY` | `200` | Priority for recognizable direct-PDF URLs. |
 | `MANUAL_REVIEW_PRIORITY` | `1000` | Priority for configured manual patterns, EBSCO viewers, and unknown layouts. |
-| `INSTITUTIONAL_URL_OVERRIDES` | One DOI-to-OSU-EBSCO mapping | Exact DOI-to-URL mappings for opaque institutional viewer URLs. Use `{}` when no overrides are needed. |
+| `INSTITUTIONAL_URL_OVERRIDES` | Three DOI-to-institutional URL mappings | Exact DOI-to-URL mappings for opaque institutional viewer URLs. Use `{}` when no overrides are needed. |
 | `TEMP_SUFFIXES` | `{".crdownload", ".part", ".download", ".tmp"}` | Files and companion files treated as incomplete downloads. |
-| `DOI_PREFIX_RULES` | Rules for `10.3390`, `10.1007`, `10.1038`, `10.1002`, `10.1111`, `10.1096`, `10.1021`, `10.3389`, `10.1073`, `10.1126`, `10.1128`, `10.1177`, `10.1089`, `10.1080`, and `10.1088` | Ordered DOI-prefix-to-publisher URL templates checked before resolving through `doi.org`. |
+| `DOI_PREFIX_RULES` | Rules for `10.3390`, `10.1007`, `10.1038`, `10.1002`, `10.1111`, `10.1096`, `10.1021`, `10.3389`, `10.1073`, `10.1126`, `10.1128`, `10.1089`, `10.1080`, and `10.1088` | Ordered DOI-prefix-to-publisher URL templates checked before resolving through `doi.org`. |
+| `DOI_REDIRECT_HOST_HINTS` | Hints for `10.1093`, `10.1158`, `10.1200`, `10.1182`, and `10.1212` | Maps unresolved DOI prefixes to likely publisher hosts for click-rule selection, blocked-rule matching, and safe automatic tab closing. |
 
 ### Publisher endpoint variables
 
@@ -469,7 +493,7 @@ These are internal URL-building defaults, not ordinary runtime switches.
 | `ACS_PROXY_HOST` | `pubs-acs-org.proxy.lib.ohio-state.edu` | OSU ACS proxy host. |
 | `ACS_ARTICLE_BASE_URL` | ACS proxy `/doi/full` URL | Base URL used for ACS DOI routes. |
 | `WILEY_PROXY_HOST` | `onlinelibrary-wiley-com.proxy.lib.ohio-state.edu` | OSU Wiley proxy host. |
-| `WILEY_ARTICLE_BASE_URL` | Wiley proxy `/doi/full` URL | Base URL used for Wiley DOI routes. |
+| `WILEY_ARTICLE_BASE_URL` | Wiley proxy `/doi/full` URL | Fallback base URL for Wiley DOI routes; journal-specific Wiley subdomains are preserved when possible. |
 | `SAGE_PROXY_HOST` | `journals-sagepub-com.proxy.lib.ohio-state.edu` | OSU SAGE proxy host. |
 | `SAGE_ARTICLE_BASE_URL` | SAGE proxy `/doi/full` URL | Base URL used for SAGE DOI routes. |
 | `LIEBERT_ARTICLE_BASE_URL` | `https://www.liebertpub.com/doi/pdf` | Public Liebert PDF base URL. |

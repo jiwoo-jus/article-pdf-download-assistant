@@ -16,7 +16,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterable, Mapping
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, unquote, urlparse, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlparse, urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -174,16 +174,16 @@ BATCH_LIMIT = 2000
 # and retry DOI resolution after a transient failure.  Set to False when the
 # saved download_url values are known to be good.
 OVERRIDE_EXISTING_DOWNLOAD_URLS = False
-OPEN_DELAY_SECONDS = 0.5
+OPEN_DELAY_SECONDS = 1.5
 WAIT_TIMEOUT_SECONDS = 600
-POLL_INTERVAL_SECONDS = 0.5
+POLL_INTERVAL_SECONDS = 1
 MIN_FILE_SIZE_BYTES = 1024
 INTERACTIVE_SKIP = True
 DRY_RUN = False
 OPEN_COMMAND: str | None = None
 BATCH_LOG_PATH: Path | None = None
 # Matching URLs are recorded as skipped instead of silently disappearing.
-BLOCKED_URL_PATTERNS = ["karger.com"]
+BLOCKED_URL_PATTERNS = ["karger.com", "ashpublications.org", "ascopubs.org", "neurology.org", "auajournals.org", "10.1158"]
 # Matching URLs remain in the queue but run in the manual-review tier.
 MANUAL_URL_PATTERNS = ["link.springer.com"]
 AUTOMATE_PUBLISHER_PDF_CLICK = True
@@ -221,10 +221,11 @@ CHROME_COOKIE_FILES = tuple(
 # publisher group, while all verified automatic routes stay ahead of records
 # that need manual review.
 AUTO_PUBLISHER_PRIORITY = {
-    "ScienceDirect": 101,
+    "ScienceDirect": 0,
     "ACS": 10,
-    "Wiley": 20,
-    "SAGE": 102,
+    "ASCO Publications": 25,
+    "Wiley": 27,
+    "SAGE": 30,
     "RSC": 40,
     "Taylor & Francis": 50,
     "Oxford Academic": 60,
@@ -232,6 +233,10 @@ AUTO_PUBLISHER_PRIORITY = {
     "IIAR Journals": 80,
     "AACR Journals": 90,
     "JAMA Network": 100,
+    "NEJM": 105,
+    "Ovid": 110,
+    "AUA Journals": 115,
+    "Nature": 120,
 }
 DIRECT_PDF_PRIORITY = 200
 MANUAL_REVIEW_PRIORITY = 1000
@@ -242,6 +247,14 @@ INSTITUTIONAL_URL_OVERRIDES = {
     "10.1007/s13277-015-4345-7": (
         "https://research-ebsco-com.proxy.lib.ohio-state.edu/"
         "c/wpogxq/viewer/pdf/qvffijf37b?route=details"
+    ),
+    "10.1212/WNL.0000000000003400": (
+        "https://oce-ovid-com.proxy.lib.ohio-state.edu/"
+        "article/00006114-201612060-00006/HTML"
+    ),
+    "10.1016/j.juro.2011.03.129": (
+        "https://www-sciencedirect-com.proxy.lib.ohio-state.edu/"
+        "science/article/pii/S0022534711035427"
     ),
 }
 
@@ -273,11 +286,30 @@ DOI_PREFIX_RULES: list[tuple[str, str]] = [
     ("10.1073/", "https://www.pnas.org/doi/pdf/{doi}"),
     ("10.1126/", "https://www.science.org/doi/pdf/{doi}"),
     ("10.1128/", "https://journals.asm.org/doi/pdf/{doi}"),
-    ("10.1177/", f"{SAGE_ARTICLE_BASE_URL}/{{doi}}"),
     ("10.1089/", f"{LIEBERT_ARTICLE_BASE_URL}/{{doi}}"),
     ("10.1080/", f"{TANDF_ARTICLE_BASE_URL}/{{doi}}"),
     ("10.1088/", "https://iopscience.iop.org/article/{doi}"),
 ]
+
+# When a network DOI lookup falls back to doi.org, these stable ownership
+# hints let browser automation select the correct publisher rule after Chrome
+# follows the redirect. They also let blocked publisher domains match before
+# the browser opens the DOI URL.
+DOI_REDIRECT_HOST_HINTS: list[tuple[str, str]] = [
+    ("10.1093/", "academic.oup.com"),
+    ("10.1158/", "aacrjournals.org"),
+    ("10.1200/", "ascopubs.org"),
+    ("10.1182/", "ashpublications.org"),
+    ("10.1212/", "www.neurology.org"),
+]
+
+
+def publisher_host_hint_for_doi(value: str) -> str:
+    doi = normalize_doi(value).casefold()
+    for prefix, host in DOI_REDIRECT_HOST_HINTS:
+        if doi.startswith(prefix.casefold()):
+            return host
+    return ""
 
 
 def strip_doi_path_slug(after_doi: str) -> str:
@@ -294,6 +326,19 @@ def is_wiley_host(host: str) -> bool:
         or host == WILEY_PROXY_HOST
         or host.endswith("-onlinelibrary-wiley-com.proxy.lib.ohio-state.edu")
     )
+
+
+def wiley_article_base_url(host: str) -> str:
+    """Preserve Wiley journal subdomains when routing through OSU EZproxy."""
+    public_suffix = ".onlinelibrary.wiley.com"
+    if host.endswith(public_suffix):
+        proxy_host = (
+            f"{host.replace('.', '-')}.proxy.lib.ohio-state.edu"
+        )
+        return f"https://{proxy_host}/doi/full"
+    if host.endswith("-onlinelibrary-wiley-com.proxy.lib.ohio-state.edu"):
+        return f"https://{host}/doi/full"
+    return WILEY_ARTICLE_BASE_URL
 
 
 def is_sage_host(host: str) -> bool:
@@ -336,17 +381,19 @@ def doi_from_doi_path(path: str) -> str:
     return unquote(value) if value.casefold().startswith("10.") else ""
 
 
-def rewrite_resolved_url(url: str) -> str:
+def rewrite_resolved_url(url: str, fallback_doi: str = "") -> str:
     # Keep legacy DOI semicolon suffixes in the path.  With urlparse(), a DOI
     # ending in ``.CO;2-X`` is exposed as path ``.CO`` plus params ``2-X``.
     parsed = urlsplit(url)
     host = (parsed.hostname or "").casefold()
     path = parsed.path
-    doi = doi_from_doi_path(path)
+    # Some publishers redirect automated DOI lookups to a cookie/error endpoint
+    # on the correct host. In that case the original DOI remains authoritative.
+    doi = doi_from_doi_path(path) or normalize_doi(fallback_doi)
     quoted_doi = encoded_doi(doi)
 
     if is_wiley_host(host) and doi:
-        return f"{WILEY_ARTICLE_BASE_URL}/{quoted_doi}"
+        return f"{wiley_article_base_url(host)}/{quoted_doi}"
 
     if host in ("pubs.acs.org", ACS_PROXY_HOST) and doi:
         return f"{ACS_ARTICLE_BASE_URL}/{quoted_doi}"
@@ -393,6 +440,15 @@ def rewrite_resolved_url(url: str) -> str:
             return url
         return f"{TANDF_ARTICLE_BASE_URL}/{quoted_doi}"
 
+    # Literatum-based journal sites use this endpoint when an automated
+    # redirect has no cookie context. Their canonical DOI route is uniform.
+    if path.casefold().rstrip("/") == "/action/cookieabsent" and doi:
+        return parsed._replace(
+            path=f"/doi/full/{quoted_doi}",
+            query="",
+            fragment="",
+        ).geturl()
+
     if host == "linkinghub.elsevier.com" and "/retrieve/pii/" in path:
         pii = path.split("/retrieve/pii/", 1)[1].strip("/").split("/", 1)[0]
         if pii:
@@ -410,6 +466,18 @@ def rewrite_resolved_url(url: str) -> str:
             doi_part = path.removeprefix("/article/").strip("/")
             if doi_part:
                 return f"https://link.springer.com/content/pdf/{doi_part}.pdf"
+
+    if path.casefold().rstrip("/") == "/crawlprevention/governor":
+        content_path = parse_qs(parsed.query).get("content", [""])[0]
+        if content_path.startswith("/") and not content_path.startswith("//"):
+            return parsed._replace(
+                path=content_path,
+                query="",
+                fragment="",
+            ).geturl()
+
+    if "error=cookies_not_supported" in parsed.query.casefold():
+        return parsed._replace(query="", fragment="").geturl()
 
     return url
 
@@ -457,7 +525,7 @@ def resolve_best_pdf_url(doi: str, resolve_timeout: float = 8.0) -> str:
         return doi_url
 
     print(f"  [RESOLVE {resolved_method}] {doi_url} -> {resolved}")
-    rewritten = rewrite_resolved_url(resolved)
+    rewritten = rewrite_resolved_url(resolved, fallback_doi=doi)
     if rewritten != resolved:
         print(f"  [REWRITE] -> {rewritten}")
     return rewritten
@@ -481,10 +549,16 @@ def describe_resolution_error(exc: Exception) -> str:
 
 
 def matching_blocked_pattern(url: str) -> str:
-    lowered = url.casefold()
+    candidate_values = [url.casefold()]
+    if is_doi_resolver_url(url):
+        hinted_host = publisher_host_hint_for_doi(url)
+        if hinted_host:
+            candidate_values.append(hinted_host.casefold())
     for pattern in BLOCKED_URL_PATTERNS:
         cleaned = pattern.strip()
-        if cleaned and cleaned.casefold() in lowered:
+        if cleaned and any(
+            cleaned.casefold() in candidate for candidate in candidate_values
+        ):
             return cleaned
     return ""
 
@@ -548,6 +622,16 @@ def is_pdf_file(path: Path) -> bool:
         return False
 
 
+def expected_sciencedirect_pii(url: str) -> str:
+    parsed = urlsplit(url)
+    host = (parsed.hostname or "").casefold()
+    if not (host.endswith("sciencedirect.com") or host == SCIENCEDIRECT_PROXY_HOST):
+        return ""
+    if "/pii/" not in parsed.path:
+        return ""
+    return parsed.path.split("/pii/", 1)[1].strip("/").split("/", 1)[0]
+
+
 def read_skip_nonblocking() -> bool:
     if not sys.stdin.isatty():
         return False
@@ -568,8 +652,11 @@ def read_skip_nonblocking() -> bool:
 
 def wait_for_download(
     known: Mapping[Path, FileSnapshot],
+    expected_url: str = "",
 ) -> tuple[Path | None, bool]:
     deadline = time.monotonic() + WAIT_TIMEOUT_SECONDS
+    expected_pii = expected_sciencedirect_pii(expected_url).casefold()
+    reported_mismatches: set[tuple[Path, int]] = set()
     while time.monotonic() < deadline:
         if INTERACTIVE_SKIP and read_skip_nonblocking():
             return None, True
@@ -581,6 +668,15 @@ def wait_for_download(
             if state is None or state == known.get(resolved_path):
                 continue
             if is_pdf_file(path):
+                if expected_pii and expected_pii not in path.name.casefold():
+                    mismatch_key = (resolved_path, state.modified_ns)
+                    if mismatch_key not in reported_mismatches:
+                        print(
+                            f"  [IGNORE PDF] {path.name} does not match "
+                            f"ScienceDirect PII {expected_pii.upper()}"
+                        )
+                        reported_mismatches.add(mismatch_key)
+                    continue
                 candidates.append((path, state))
 
         if candidates:
@@ -666,6 +762,8 @@ def reopen_chrome() -> bool:
 def close_completed_automatic_tab(url: str) -> bool:
     """Close the active automated tab when it still belongs to the target host."""
     expected_host = (urlparse(url).hostname or "").casefold()
+    if is_doi_resolver_url(url):
+        expected_host = publisher_host_hint_for_doi(url) or expected_host
     if (
         not expected_host
         or sys.platform != "darwin"
@@ -1019,11 +1117,19 @@ def recover_from_sciencedirect_request_error(
 
 def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
     host = (urlparse(url).hostname or "").casefold()
+    if is_doi_resolver_url(url):
+        hinted_host = publisher_host_hint_for_doi(url)
+        if hinted_host:
+            return publisher_pdf_click_rule(f"https://{hinted_host}/")
     if host.endswith("sciencedirect.com") or host == SCIENCEDIRECT_PROXY_HOST:
         return PublisherClickRule(
             publisher="ScienceDirect",
             pdf_selector=(
-                'a[aria-label^="View PDF"][href*="/pdfft"], a[href*="/pdfft"]'
+                'a[aria-label^="View PDF"][href*="/pdfft"], '
+                'a[href*="/pdfft"], '
+                'li.ViewPDF a[href*="/science/article/pii/"][href*="/pdf"], '
+                'a[aria-label^="View PDF"][href*="/pdf"], '
+                'a[href*="/science/article/pii/"][href*="/pdf"]'
             ),
             dismiss_selector=(
                 '#pendo-base button._pendo-close-guide[aria-label="Close"], '
@@ -1040,6 +1146,30 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
             pdf_selector=(
                 'a[data-id="article_header_OpenPDF"][href*="/doi/pdf/"], '
                 'a.article__btn__secondary--pdf[href*="/doi/pdf/"]'
+            ),
+        )
+    if is_public_or_osu_proxy_host(host, "ascopubs.org"):
+        return PublisherClickRule(
+            publisher="ASCO Publications",
+            pdf_selector=(
+                'a.btn--pdf[href*="/doi/pdf/"], '
+                'a[aria-label*="PDF"][href*="/doi/pdf/"], '
+                'a[href*="/doi/pdf/"]'
+            ),
+            download_selector=(
+                'a.embedded--download--btn[href*="/doi/pdfdirect/"], '
+                'a[aria-label="Download PDF"][href*="/doi/pdfdirect/"], '
+                '#main-content a[href*="/doi/pdfdirect/"], '
+                'a[href*="/doi/pdfdirect/"]'
+            ),
+        )
+    if is_public_or_osu_proxy_host(host, "www.nejm.org"):
+        return PublisherClickRule(
+            publisher="NEJM",
+            pdf_selector=(
+                'a.btn--pdf[href*="/doi/pdf/"], '
+                'a[aria-label="View PDF"][href*="/doi/pdf/"], '
+                'a[href*="/doi/pdf/"]'
             ),
         )
     if is_wiley_host(host):
@@ -1067,8 +1197,13 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
                 'a[href*="/doi/reader/"]'
             ),
             download_selector=(
+                'a.navbar-download.format-download-btn'
+                '[data-download-files-key="pdf"][href*="/doi/pdf/"], '
+                'a.navbar-download[data-single-download="true"]'
+                '[href*="/doi/pdf/"], '
+                'a[data-download-files-key="pdf"][href*="/doi/pdf/"], '
                 'a#favourite-download[href*="/doi/pdf/"], '
-                'a[aria-label="Download PDF"][href*="/doi/pdf/"]'
+                'a[aria-label^="Download PDF"][href*="/doi/pdf/"]'
             ),
         )
     if host == "pubs.rsc.org" or host.endswith(
@@ -1141,6 +1276,33 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
                 'a#pdf-link.js-pdfaccess[data-article-url$=".pdf"], '
                 'a.js-pdfaccess[aria-label="Download PDF"]'
                 '[data-article-url$=".pdf"]'
+            ),
+        )
+    if is_public_or_osu_proxy_host(host, "oce.ovid.com"):
+        return PublisherClickRule(
+            publisher="Ovid",
+            pdf_selector=(
+                'button#downloadpdf-button[aria-label="Download PDF"], '
+                'button.rectangle-btn[aria-label="Download PDF"]'
+            ),
+        )
+    if is_public_or_osu_proxy_host(host, "auajournals.org"):
+        return PublisherClickRule(
+            publisher="AUA Journals",
+            pdf_selector=(
+                'a.main-link[aria-label="PDF"][href*="/doi/epdf/"], '
+                'a[aria-label="PDF"][href*="/doi/epdf/"], '
+                'a[href*="/doi/epdf/"]'
+            ),
+        )
+    if is_public_or_osu_proxy_host(host, "nature.com"):
+        return PublisherClickRule(
+            publisher="Nature",
+            pdf_selector=(
+                'a[data-test="download-pdf"][href$=".pdf"], '
+                'a[data-article-pdf="true"][href$=".pdf"], '
+                'a.c-pdf-download__link[href$=".pdf"], '
+                'a[href*="/articles/"][href$=".pdf"]'
             ),
         )
     return None
@@ -1269,8 +1431,10 @@ def open_publisher_and_click_pdf(
   if (!link) return 'waiting';
   if (link.dataset.automatedPdfClick === 'true') return 'waiting';
   link.dataset.automatedPdfClick = 'true';
-  link.target = '_self';
+  const legacyScienceDirectLink = link.closest('li.ViewPDF') !== null;
+  if (!legacyScienceDirectLink) link.target = '_self';
   link.click();
+  if (legacyScienceDirectLink) return 'download_clicked';
   if (requestErrorSelector && requestErrorText) {
     return 'download_clicked_monitoring';
   }
@@ -1345,7 +1509,10 @@ end run
             timeout=PUBLISHER_CLICK_TIMEOUT_SECONDS + 10,
         )
     except subprocess.TimeoutExpired:
-        print(f"  [AUTO-PDF] {publisher} automation timed out")
+        print(
+            f"  [AUTO-PDF] {publisher} status check timed out; "
+            "the PDF click may already have started"
+        )
         return PublisherOpenStatus.AUTOMATION_FAILED
     except OSError as exc:
         print(f"  [AUTO-PDF] Chrome automation unavailable: {exc}")
@@ -1536,28 +1703,38 @@ def build_queue(
             if url != existing_url:
                 print(f"  [OVERRIDE] doi={doi} -> {url}")
         elif OVERRIDE_EXISTING_DOWNLOAD_URLS:
-            refreshed_url = resolve_best_pdf_url(doi)
-            refresh_failed = (
-                is_http_url(existing_url)
-                and not is_doi_resolver_url(existing_url)
-                and is_doi_resolver_url(refreshed_url)
+            repaired_url = (
+                rewrite_resolved_url(existing_url, fallback_doi=doi)
+                if is_http_url(existing_url)
+                else existing_url
             )
-            if refresh_failed:
-                url = existing_url
-                action = "kept_after_refresh_failure"
-                print(
-                    "  [KEEP URL] DOI refresh returned only a fallback; "
-                    f"retaining {existing_url}"
-                )
+            if repaired_url != existing_url:
+                url = repaired_url
+                action = "repaired"
+                print(f"  [REPAIR URL] {existing_url} -> {url}")
             else:
-                url = refreshed_url
-                action = (
-                    "doi_fallback"
-                    if is_doi_resolver_url(url)
-                    else "refreshed"
+                refreshed_url = resolve_best_pdf_url(doi)
+                refresh_failed = (
+                    is_http_url(existing_url)
+                    and not is_doi_resolver_url(existing_url)
+                    and is_doi_resolver_url(refreshed_url)
                 )
-            if existing_url and url != existing_url:
-                print(f"  [REFRESH URL] {existing_url} -> {url}")
+                if refresh_failed:
+                    url = existing_url
+                    action = "kept_after_refresh_failure"
+                    print(
+                        "  [KEEP URL] DOI refresh returned only a fallback; "
+                        f"retaining {existing_url}"
+                    )
+                else:
+                    url = refreshed_url
+                    action = (
+                        "doi_fallback"
+                        if is_doi_resolver_url(url)
+                        else "refreshed"
+                    )
+                if existing_url and url != existing_url:
+                    print(f"  [REFRESH URL] {existing_url} -> {url}")
         elif is_http_url(existing_url):
             url = existing_url
             action = "reused"
@@ -1777,7 +1954,7 @@ def main() -> int:
             skip_keys = "'s'" if os.name == "nt" else "'s' + Enter"
             hint = f"| press {skip_keys} to skip" if INTERACTIVE_SKIP else ""
             print(f"  [WAIT] {WAIT_TIMEOUT_SECONDS}s {hint}".rstrip())
-            new_file, skipped = wait_for_download(known)
+            new_file, skipped = wait_for_download(known, expected_url=url)
 
             if skipped:
                 finished_at = now_timestamp()
