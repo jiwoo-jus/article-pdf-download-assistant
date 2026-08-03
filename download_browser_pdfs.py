@@ -189,7 +189,7 @@ DRY_RUN = False
 OPEN_COMMAND: str | None = None
 BATCH_LOG_PATH: Path | None = None
 # Matching URLs are recorded as skipped instead of silently disappearing.
-BLOCKED_URL_PATTERNS = ["karger.com", "ashpublications.org", "ascopubs.org", "neurology.org", "auajournals.org", "10.1158", "ovid.com", "ovid.com", "jamaoto", "jamaoncol", "Wiley", "eurekaselect.com"]
+BLOCKED_URL_PATTERNS = ["karger.com", "10.1159", "ashpublications.org", "ascopubs.org", "neurology.org", "auajournals.org", "10.1158", "ovid.com", "jamaoto", "jamaoncol", "eurekaselect.com", "ersnet.org", "10.23736", "degruyterbrill.com", "dustri.com"]
 # Matching URLs remain in the queue but run in the manual-review tier.
 MANUAL_URL_PATTERNS = [] #"link.springer.com"
 AUTOMATE_PUBLISHER_PDF_CLICK = True
@@ -247,6 +247,9 @@ AUTO_PUBLISHER_PRIORITY = {
     "Cancer Research and Treatment": 130,
     "BMJ": 135,
     "JCI Insight": 140,
+    "PLOS": 145,
+    "Oncotarget": 147,
+    "ACP Journals": 149,
     "ScienceDirect": 150,
 }
 
@@ -313,13 +316,22 @@ DOI_REDIRECT_HOST_HINTS: list[tuple[str, str]] = [
     ("10.1097/", "www.ovid.com"),
     ("10.1136/", "bmj.com"),
     ("10.1158/", "aacrjournals.org"),
+    ("10.1186/s40425-", "bmj.com"),
     ("10.1200/", "ascopubs.org"),
+    ("10.1210/", "academic.oup.com"),
     ("10.1182/", "ashpublications.org"),
     ("10.1212/", "www.neurology.org"),
+    ("10.1371/", "journals.plos.org"),
+    ("10.1086/340133", "academic.oup.com"),
     ("10.1634/", "academic.oup.com"),
+    ("10.18632/", "www.oncotarget.com"),
     ("10.21873/", "iiarjournals.org"),
+    ("10.2217/", "www.tandfonline.com"),
+    ("10.3109/", "www.tandfonline.com"),
     ("10.3324/", "haematologica.org"),
     ("10.4143/", "www.e-crt.org"),
+    ("10.7205/", "academic.oup.com"),
+    ("10.7326/", "www.acpjournals.org"),
 ]
 
 
@@ -1326,6 +1338,40 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
             ),
             download_ready_selector=(
                 'form#download_pdf_form input[id^="recaptcha-token-"]'
+            ),
+        )
+    if is_public_or_osu_proxy_host(host, "journals.plos.org"):
+        return PublisherClickRule(
+            publisher="PLOS",
+            pdf_selector=(
+                'div.dload-pdf a#downloadPdf'
+                '[href*="/article/file?"][href*="type=printable"], '
+                'a#downloadPdf[href*="/article/file?"]'
+                '[href*="type=printable"]'
+            ),
+        )
+    if is_public_or_osu_proxy_host(host, "oncotarget.com"):
+        return PublisherClickRule(
+            publisher="Oncotarget",
+            pdf_selector=(
+                'a.file[href*="/article/"][href*="/pdf/"], '
+                'a[href*="/article/"][href*="/pdf/"]'
+            ),
+        )
+    if is_public_or_osu_proxy_host(host, "acpjournals.org"):
+        return PublisherClickRule(
+            publisher="ACP Journals",
+            pdf_selector=(
+                'div.info-panel__formats a.btn--pdf'
+                '[href*="/doi/reader/"], '
+                'a.btn--pdf[aria-label="Open full-text in eReader"]'
+                '[href*="/doi/reader/"]'
+            ),
+            download_selector=(
+                'a.navbar-download[data-single-download="true"]'
+                '[data-download-files-key="pdf"][href*="/doi/pdf/"], '
+                'a[aria-label^="Download PDF"]'
+                '[href*="/doi/pdf/"][href*="download=true"]'
             ),
         )
     if is_public_or_osu_proxy_host(host, "aacrjournals.org"):

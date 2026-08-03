@@ -348,6 +348,9 @@ Known automatic click rules currently cover:
 - Cancer Research and Treatment
 - BMJ
 - JCI Insight
+- PLOS
+- Oncotarget
+- ACP Journals
 
 Recognizable direct-PDF URLs are also placed in the automatic tier. EBSCO
 institutional viewer URLs and unknown publisher layouts remain in the
@@ -478,13 +481,13 @@ preserved among rows with the same priority.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `AUTO_PUBLISHER_PRIORITY` | ScienceDirect `0`; ACS `10`; ASCO Publications `25`; Wiley `27`; SAGE `30`; RSC `40`; Taylor & Francis `50`; Oxford Academic `60`; IOPscience `70`; IIAR Journals `80`; AACR Journals `90`; JAMA Network `100`; NEJM `105`; Ovid `110`; AUA Journals `115`; Nature `120`; Haematologica `125`; Cancer Research and Treatment `130`; BMJ `135`; JCI Insight `140` | Processing order for verified publisher click rules. |
+| `AUTO_PUBLISHER_PRIORITY` | Springer Nature `0`; Wiley `5`; ACS `10`; ASCO Publications `15`; Oxford Academic `20`; Taylor & Francis `25`; SAGE `30`; RSC `40`; IOPscience `70`; IIAR Journals `80`; AACR Journals `90`; JAMA Network `100`; NEJM `105`; Ovid `110`; AUA Journals `115`; Nature `120`; Haematologica `125`; Cancer Research and Treatment `130`; BMJ `135`; JCI Insight `140`; PLOS `145`; Oncotarget `147`; ACP Journals `149`; ScienceDirect `150` | Processing order for verified publisher click rules. |
 | `DIRECT_PDF_PRIORITY` | `200` | Priority for recognizable direct-PDF URLs. |
 | `MANUAL_REVIEW_PRIORITY` | `1000` | Priority for configured manual patterns, EBSCO viewers, and unknown layouts. |
 | `INSTITUTIONAL_URL_OVERRIDES` | Three DOI-to-institutional URL mappings | Exact DOI-to-URL mappings for opaque institutional viewer URLs. Use `{}` when no overrides are needed. |
 | `TEMP_SUFFIXES` | `{".crdownload", ".part", ".download", ".tmp"}` | Files and companion files treated as incomplete downloads. |
 | `DOI_PREFIX_RULES` | Rules for `10.3390`, `10.1007`, `10.1038`, `10.1002`, `10.1111`, `10.1096`, `10.1021`, `10.3389`, `10.1073`, `10.1126`, `10.1128`, `10.1089`, `10.1080`, and `10.1088` | Ordered DOI-prefix-to-publisher URL templates checked before resolving through `doi.org`. |
-| `DOI_REDIRECT_HOST_HINTS` | Hints for `10.1001`, `10.1093`, `10.1097`, `10.1136`, `10.1158`, `10.1200`, `10.1182`, `10.1212`, `10.1634`, `10.21873`, `10.3324`, and `10.4143` | Maps unresolved DOI prefixes to likely publisher hosts for click-rule selection, blocked-rule matching, and safe automatic tab closing. |
+| `DOI_REDIRECT_HOST_HINTS` | Hints for `10.1001`, exact legacy JID `10.1086/340133`, `10.1093`, `10.1097`, `10.1136`, `10.1158`, legacy JITC `10.1186/s40425-*`, `10.1200`, `10.1210`, `10.1182`, `10.1212`, `10.1371`, `10.1634`, `10.18632`, `10.21873`, `10.2217`, `10.3109`, `10.3324`, `10.4143`, `10.7205`, and `10.7326` | Maps unresolved DOI prefixes to likely publisher hosts for click-rule selection, blocked-rule matching, and safe automatic tab closing. |
 
 ### Publisher endpoint variables
 
