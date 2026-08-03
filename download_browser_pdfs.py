@@ -56,6 +56,11 @@ class PublisherClickRule:
     dismiss_selector: str | None = None
     request_error_selector: str | None = None
     request_error_text: str | None = None
+    download_unavailable_selector: str | None = None
+    download_unavailable_texts: tuple[str, ...] = ()
+    direct_navigation: bool = False
+    download_unavailable_statuses: tuple[int, ...] = ()
+    download_ready_selector: str | None = None
 
 
 @dataclass(frozen=True)
@@ -74,6 +79,7 @@ class DownloadStrategy:
 class PublisherOpenStatus(Enum):
     OPENED = "opened"
     REQUEST_BLOCKED = "request_blocked"
+    DOWNLOAD_UNAVAILABLE = "download_unavailable"
     AUTOMATION_FAILED = "automation_failed"
 
 
@@ -175,7 +181,7 @@ BATCH_LIMIT = 2000
 # saved download_url values are known to be good.
 OVERRIDE_EXISTING_DOWNLOAD_URLS = False
 OPEN_DELAY_SECONDS = 1.5
-WAIT_TIMEOUT_SECONDS = 600
+WAIT_TIMEOUT_SECONDS = 10
 POLL_INTERVAL_SECONDS = 1
 MIN_FILE_SIZE_BYTES = 1024
 INTERACTIVE_SKIP = True
@@ -183,9 +189,9 @@ DRY_RUN = False
 OPEN_COMMAND: str | None = None
 BATCH_LOG_PATH: Path | None = None
 # Matching URLs are recorded as skipped instead of silently disappearing.
-BLOCKED_URL_PATTERNS = ["karger.com", "ashpublications.org", "ascopubs.org", "neurology.org", "auajournals.org", "10.1158"]
+BLOCKED_URL_PATTERNS = ["karger.com", "ashpublications.org", "ascopubs.org", "neurology.org", "auajournals.org", "10.1158", "ovid.com", "ovid.com", "jamaoto", "jamaoncol", "Wiley", "eurekaselect.com"]
 # Matching URLs remain in the queue but run in the manual-review tier.
-MANUAL_URL_PATTERNS = ["link.springer.com"]
+MANUAL_URL_PATTERNS = [] #"link.springer.com"
 AUTOMATE_PUBLISHER_PDF_CLICK = True
 PUBLISHER_CLICK_TIMEOUT_SECONDS = 20
 AUTO_CLEAR_BROWSER_CACHE = True
@@ -221,14 +227,14 @@ CHROME_COOKIE_FILES = tuple(
 # publisher group, while all verified automatic routes stay ahead of records
 # that need manual review.
 AUTO_PUBLISHER_PRIORITY = {
-    "ScienceDirect": 0,
+    "Springer Nature": 0,
+    "Wiley": 5,
     "ACS": 10,
-    "ASCO Publications": 25,
-    "Wiley": 27,
+    "ASCO Publications": 15,
+    "Oxford Academic": 20,
+    "Taylor & Francis": 25,
     "SAGE": 30,
     "RSC": 40,
-    "Taylor & Francis": 50,
-    "Oxford Academic": 60,
     "IOPscience": 70,
     "IIAR Journals": 80,
     "AACR Journals": 90,
@@ -237,7 +243,13 @@ AUTO_PUBLISHER_PRIORITY = {
     "Ovid": 110,
     "AUA Journals": 115,
     "Nature": 120,
+    "Haematologica": 125,
+    "Cancer Research and Treatment": 130,
+    "BMJ": 135,
+    "JCI Insight": 140,
+    "ScienceDirect": 150,
 }
+
 DIRECT_PDF_PRIORITY = 200
 MANUAL_REVIEW_PRIORITY = 1000
 
@@ -296,11 +308,18 @@ DOI_PREFIX_RULES: list[tuple[str, str]] = [
 # follows the redirect. They also let blocked publisher domains match before
 # the browser opens the DOI URL.
 DOI_REDIRECT_HOST_HINTS: list[tuple[str, str]] = [
+    ("10.1001/", "jamanetwork.com"),
     ("10.1093/", "academic.oup.com"),
+    ("10.1097/", "www.ovid.com"),
+    ("10.1136/", "bmj.com"),
     ("10.1158/", "aacrjournals.org"),
     ("10.1200/", "ascopubs.org"),
     ("10.1182/", "ashpublications.org"),
     ("10.1212/", "www.neurology.org"),
+    ("10.1634/", "academic.oup.com"),
+    ("10.21873/", "iiarjournals.org"),
+    ("10.3324/", "haematologica.org"),
+    ("10.4143/", "www.e-crt.org"),
 ]
 
 
@@ -1121,6 +1140,26 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
         hinted_host = publisher_host_hint_for_doi(url)
         if hinted_host:
             return publisher_pdf_click_rule(f"https://{hinted_host}/")
+    if is_public_or_osu_proxy_host(host, "link.springer.com"):
+        return PublisherClickRule(
+            publisher="Springer Nature",
+            pdf_selector='a[href$=".pdf"]',
+            download_unavailable_selector=(
+                'div.c-notes[data-test="c-notes"] p.c-notes__text, '
+                'p.c-status-message--info a#test-login-banner-link, '
+                'div[data-test="access-article"] '
+                '[data-test="access-via-institution"], '
+                'div[data-test="access-article"] '
+                '[data-test-id="buy-article-darwin"]'
+            ),
+            download_unavailable_texts=(
+                "This is a preview of subscription content",
+                "log in via an institution",
+                "Buy article PDF",
+            ),
+            direct_navigation=True,
+            download_unavailable_statuses=(404,),
+        )
     if host.endswith("sciencedirect.com") or host == SCIENCEDIRECT_PROXY_HOST:
         return PublisherClickRule(
             publisher="ScienceDirect",
@@ -1187,6 +1226,19 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
                 '[href*="/doi/pdfdirect/"], '
                 'a.download[data-download-files-key="pdf"]'
                 '[href*="/doi/pdfdirect/"]'
+            ),
+            reveal_download_selector=(
+                'button.dropdown-trigger[aria-label="Download document"]'
+                '[aria-haspopup="true"], '
+                '.navbar-download button.dropdown-trigger[aria-haspopup="true"]'
+            ),
+            download_unavailable_selector=(
+                '.popup_container.backgroundNotice .text-container .text, '
+                '.navbar-download .dropdown-content .dropdown-text'
+            ),
+            download_unavailable_texts=(
+                "Downloading and printing are disabled",
+                "You do not have permission to download",
             ),
         )
     if is_sage_host(host):
@@ -1257,7 +1309,23 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
             publisher="IIAR Journals",
             pdf_selector=(
                 'a[data-trigger="tab-pdf"][href$=".full.pdf"], '
-                'a[href*="/content/anticanres/"][href$=".full.pdf"]'
+                'a[href*="/content/anticanres/"][href$=".full.pdf"], '
+                'a.link-icon[href*="/content/invivo/"]'
+                '[href$=".full-text.pdf"], '
+                'a[href*="/content/"][href$=".full-text.pdf"]'
+            ),
+        )
+    if is_public_or_osu_proxy_host(host, "insight.jci.org"):
+        return PublisherClickRule(
+            publisher="JCI Insight",
+            pdf_selector=(
+                'a[href*="/articles/view/"][href$="/pdf"]'
+            ),
+            download_selector=(
+                'form#download_pdf_form[action$="/pdf/render.pdf"] button'
+            ),
+            download_ready_selector=(
+                'form#download_pdf_form input[id^="recaptcha-token-"]'
             ),
         )
     if is_public_or_osu_proxy_host(host, "aacrjournals.org"):
@@ -1278,12 +1346,19 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
                 '[data-article-url$=".pdf"]'
             ),
         )
-    if is_public_or_osu_proxy_host(host, "oce.ovid.com"):
+    if (
+        is_public_or_osu_proxy_host(host, "oce.ovid.com")
+        or is_public_or_osu_proxy_host(host, "www.ovid.com")
+    ):
         return PublisherClickRule(
             publisher="Ovid",
             pdf_selector=(
+                "button.omni-article-tool__pdf, "
                 'button#downloadpdf-button[aria-label="Download PDF"], '
                 'button.rectangle-btn[aria-label="Download PDF"]'
+            ),
+            download_unavailable_selector=(
+                'button.omni-article-tool__check-access'
             ),
         )
     if is_public_or_osu_proxy_host(host, "auajournals.org"):
@@ -1303,6 +1378,33 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
                 'a[data-article-pdf="true"][href$=".pdf"], '
                 'a.c-pdf-download__link[href$=".pdf"], '
                 'a[href*="/articles/"][href$=".pdf"]'
+            ),
+        )
+    if is_public_or_osu_proxy_host(host, "haematologica.org"):
+        return PublisherClickRule(
+            publisher="Haematologica",
+            pdf_selector=(
+                'a.galley-link.obj_galley_link.pdf[href*="/article/view/"], '
+                'a.obj_galley_link.pdf[href*="/article/view/"]'
+            ),
+        )
+    if is_public_or_osu_proxy_host(host, "e-crt.org"):
+        return PublisherClickRule(
+            publisher="Cancer Research and Treatment",
+            pdf_selector=(
+                'p.download a[onclick*="journal_download"][onclick*="\'pdf\'"], '
+                'a[onclick*="journal_download"][onclick*="\'pdf\'"]'
+            ),
+        )
+    if is_public_or_osu_proxy_host(host, "bmj.com"):
+        return PublisherClickRule(
+            publisher="BMJ",
+            pdf_selector=(
+                'div[data-testid="pdf"] '
+                'a[data-testid="pdf-button-link"]'
+                '[href*="/content/"][href$=".full.pdf"], '
+                'a[data-testid="pdf-button-link"]'
+                '[href*="/content/"][href$=".full.pdf"]'
             ),
         )
     return None
@@ -1374,6 +1476,11 @@ def open_publisher_and_click_pdf(
     dismiss_selector: str | None = None,
     request_error_selector: str | None = None,
     request_error_text: str | None = None,
+    download_unavailable_selector: str | None = None,
+    download_unavailable_texts: tuple[str, ...] = (),
+    direct_navigation: bool = False,
+    download_unavailable_statuses: tuple[int, ...] = (),
+    download_ready_selector: str | None = None,
 ) -> PublisherOpenStatus:
     """Open a publisher article and click through to its final PDF download."""
     if sys.platform != "darwin" or not shutil.which("osascript"):
@@ -1387,6 +1494,12 @@ def open_publisher_and_click_pdf(
   const dismissSelector = __DISMISS_SELECTOR__;
   const requestErrorSelector = __REQUEST_ERROR_SELECTOR__;
   const requestErrorText = __REQUEST_ERROR_TEXT__;
+  const downloadUnavailableSelector = __DOWNLOAD_UNAVAILABLE_SELECTOR__;
+  const downloadUnavailableTexts = __DOWNLOAD_UNAVAILABLE_TEXTS__;
+  const pdfSelector = __PDF_SELECTOR__;
+  const directNavigation = __DIRECT_NAVIGATION__;
+  const downloadUnavailableStatuses = __DOWNLOAD_UNAVAILABLE_STATUSES__;
+  const downloadReadySelector = __DOWNLOAD_READY_SELECTOR__;
   if (requestErrorSelector && requestErrorText) {
     const requestError = document.querySelector(requestErrorSelector);
     const normalizedErrorText = requestError?.textContent
@@ -1395,6 +1508,41 @@ def open_publisher_and_click_pdf(
     if (normalizedErrorText?.includes(requestErrorText)) {
       return 'request_blocked';
     }
+  }
+
+  if (downloadUnavailableStatuses.length > 0) {
+    const navigationEntry = performance.getEntriesByType('navigation')[0];
+    const responseStatus = Number(navigationEntry?.responseStatus || 0);
+    if (downloadUnavailableStatuses.includes(responseStatus)) {
+      return 'download_unavailable';
+    }
+  }
+
+  if (downloadUnavailableSelector) {
+    const unavailableMessages = [
+      ...document.querySelectorAll(downloadUnavailableSelector),
+    ];
+    const unavailable = unavailableMessages.some((message) => {
+      const messageText = message.textContent?.replace(/\s+/g, ' ').trim()
+        .toLocaleLowerCase();
+      const selectorOnlyUnavailable = downloadUnavailableTexts.length === 0 &&
+        !document.querySelector(pdfSelector);
+      return messageText && (
+        selectorOnlyUnavailable ||
+        downloadUnavailableTexts.some((expectedText) =>
+          messageText.includes(expectedText.toLocaleLowerCase())
+        )
+      );
+    });
+    if (unavailable) return 'download_unavailable';
+  }
+
+  if (directNavigation) {
+    if (document.readyState !== 'complete') return 'waiting';
+    window.__automatedAccessCheckReadyAt ??= Date.now();
+    const accessCheckSettled =
+      Date.now() - window.__automatedAccessCheckReadyAt >= 4000;
+    return accessCheckSettled ? 'navigation_complete' : 'waiting';
   }
 
   if (dismissSelector) {
@@ -1411,7 +1559,13 @@ def open_publisher_and_click_pdf(
 
   if (downloadSelector) {
     const downloadLink = document.querySelector(downloadSelector);
-    if (downloadLink) {
+    const downloadReadyElement = downloadReadySelector
+      ? document.querySelector(downloadReadySelector)
+      : null;
+    const downloadIsReady = !downloadReadySelector || Boolean(
+      downloadReadyElement?.value
+    );
+    if (downloadLink && downloadIsReady) {
       downloadLink.target = '_self';
       downloadLink.click();
       return 'download_clicked';
@@ -1427,11 +1581,23 @@ def open_publisher_and_click_pdf(
     }
   }
 
-  const link = document.querySelector(__PDF_SELECTOR__);
+  const link = document.querySelector(pdfSelector);
   if (!link) return 'waiting';
   if (link.dataset.automatedPdfClick === 'true') return 'waiting';
   link.dataset.automatedPdfClick = 'true';
   const legacyScienceDirectLink = link.closest('li.ViewPDF') !== null;
+  const wileyEpdfLink = link.matches(
+    'a.pdf-download[href*="/doi/epdf/"], a[title="ePDF"][href*="/doi/epdf/"]'
+  );
+  if (wileyEpdfLink) return `navigate_epdf:${link.href}`;
+  const bmjPdfLink = link.matches(
+    'a[data-testid="pdf-button-link"][href*="/content/"][href$=".full.pdf"]'
+  );
+  if (bmjPdfLink) {
+    const bmjPdfHref = link.getAttribute('href');
+    const bmjPdfUrl = new URL(bmjPdfHref, window.location.origin).href;
+    return `navigate_bmj_pdf:${bmjPdfUrl}`;
+  }
   if (!legacyScienceDirectLink) link.target = '_self';
   link.click();
   if (legacyScienceDirectLink) return 'download_clicked';
@@ -1451,6 +1617,21 @@ def open_publisher_and_click_pdf(
     ).replace(
         "__REQUEST_ERROR_TEXT__", json.dumps(request_error_text)
     ).replace(
+        "__DOWNLOAD_UNAVAILABLE_SELECTOR__",
+        json.dumps(download_unavailable_selector),
+    ).replace(
+        "__DOWNLOAD_UNAVAILABLE_TEXTS__",
+        json.dumps(download_unavailable_texts),
+    ).replace(
+        "__DIRECT_NAVIGATION__",
+        json.dumps(direct_navigation),
+    ).replace(
+        "__DOWNLOAD_UNAVAILABLE_STATUSES__",
+        json.dumps(download_unavailable_statuses),
+    ).replace(
+        "__DOWNLOAD_READY_SELECTOR__",
+        json.dumps(download_ready_selector),
+    ).replace(
         "__PDF_SELECTOR__", json.dumps(selector)
     ).strip()
     apple_script = f"""
@@ -1462,6 +1643,7 @@ on run argv
         if (count of windows) is 0 then make new window
         set articleTab to make new tab at end of tabs of front window with properties {{URL:targetUrl}}
         set active tab index of front window to (count of tabs of front window)
+        set directNavigation to {str(direct_navigation).lower()}
         set pdfPageOpened to false
         set popupDismissed to false
         set monitoredDownloadChecksRemaining to 0
@@ -1472,6 +1654,18 @@ on run argv
             try
                 set clickResult to execute articleTab javascript clickScript
                 if clickResult is "request_blocked" then return "request_blocked"
+                if clickResult is "download_unavailable" then return "download_unavailable"
+                if clickResult is "navigation_complete" then return "navigation_complete"
+                if clickResult starts with "navigate_epdf:" then
+                    set epdfUrl to text 15 thru -1 of clickResult
+                    set URL of articleTab to epdfUrl
+                    set pdfPageOpened to true
+                end if
+                if clickResult starts with "navigate_bmj_pdf:" then
+                    set bmjPdfUrl to text 18 thru -1 of clickResult
+                    set URL of articleTab to bmjPdfUrl
+                    return "download_clicked"
+                end if
                 if clickResult is "download_clicked" then
                     if popupDismissed then return "download_clicked_after_popup"
                     return "download_clicked"
@@ -1489,6 +1683,13 @@ on run argv
                 if clickResult is "download_menu_opened" then set pdfPageOpened to true
                 if clickResult is "popup_dismissed" then set popupDismissed to true
             on error errorMessage
+                if directNavigation then
+                    try
+                        set articleUrl to URL of articleTab
+                    on error
+                        return "navigation_started"
+                    end try
+                end if
                 set lastJavaScriptError to errorMessage
             end try
         end repeat
@@ -1526,6 +1727,21 @@ end run
         )
         return PublisherOpenStatus.REQUEST_BLOCKED
 
+    if status == "download_unavailable":
+        print(
+            f"  [AUTO-PDF] {publisher} reports that PDF downloading is unavailable",
+            flush=True,
+        )
+        return PublisherOpenStatus.DOWNLOAD_UNAVAILABLE
+
+    if status == "navigation_complete":
+        print(f"  [AUTO-PDF] checked {publisher} access state")
+        return PublisherOpenStatus.OPENED
+
+    if status == "navigation_started":
+        print(f"  [AUTO-PDF] {publisher} direct PDF request started")
+        return PublisherOpenStatus.OPENED
+
     if status in {"download_clicked", "download_clicked_after_popup"}:
         if status == "download_clicked_after_popup":
             print(f"  [AUTO-PDF] dismissed {publisher} popup")
@@ -1555,9 +1771,10 @@ def open_url(url: str) -> PublisherOpenStatus:
         subprocess.run([*shlex.split(OPEN_COMMAND), url], check=False)
         return PublisherOpenStatus.OPENED
 
-    if AUTOMATE_PUBLISHER_PDF_CLICK and download_strategy(url).automatic:
+    if AUTOMATE_PUBLISHER_PDF_CLICK:
+        strategy = download_strategy(url)
         click_rule = publisher_pdf_click_rule(url)
-        if click_rule:
+        if click_rule and (strategy.automatic or click_rule.direct_navigation):
             open_status = open_publisher_and_click_pdf(
                 url,
                 click_rule.publisher,
@@ -1567,6 +1784,11 @@ def open_url(url: str) -> PublisherOpenStatus:
                 click_rule.dismiss_selector,
                 click_rule.request_error_selector,
                 click_rule.request_error_text,
+                click_rule.download_unavailable_selector,
+                click_rule.download_unavailable_texts,
+                click_rule.direct_navigation,
+                click_rule.download_unavailable_statuses,
+                click_rule.download_ready_selector,
             )
             if open_status is not PublisherOpenStatus.AUTOMATION_FAILED:
                 return open_status
@@ -1891,11 +2113,15 @@ def main() -> int:
         log_event({"event": "open", "pmid": pmid, "url": url, "started_at": started_at})
 
         request_error_failure = ""
+        download_unavailable = False
         if not DRY_RUN:
             request_error_retries = 0
             while True:
                 open_status = open_url(url)
                 time.sleep(OPEN_DELAY_SECONDS)
+                if open_status is PublisherOpenStatus.DOWNLOAD_UNAVAILABLE:
+                    download_unavailable = True
+                    break
                 if open_status is not PublisherOpenStatus.REQUEST_BLOCKED:
                     break
 
@@ -1920,6 +2146,37 @@ def main() -> int:
                     break
 
         if DRY_RUN:
+            continue
+
+        if download_unavailable:
+            finished_at = now_timestamp()
+            reason = "publisher_download_unavailable"
+            print("  [SKIP] publisher does not permit this PDF download")
+            log_event(
+                {
+                    "event": "skipped",
+                    "pmid": pmid,
+                    "url": url,
+                    "reason": reason,
+                    "started_at": started_at,
+                    "finished_at": finished_at,
+                }
+            )
+            write_result(
+                row,
+                status="skipped",
+                error=reason,
+                started_at=started_at,
+                finished_at=finished_at,
+                url=url,
+            )
+            write_csv_rows(OUTPUT_CSV, fieldnames, rows)
+            click_rule = publisher_pdf_click_rule(url)
+            should_close_tab = strategy.automatic or bool(
+                click_rule and click_rule.direct_navigation
+            )
+            if CLOSE_COMPLETED_AUTOMATIC_TABS and should_close_tab:
+                close_completed_automatic_tab(url)
             continue
 
         if request_error_failure:
@@ -2009,7 +2266,15 @@ def main() -> int:
                     output_path=str(destination),
                 )
                 write_csv_rows(OUTPUT_CSV, fieldnames, rows)
-                if CLOSE_COMPLETED_AUTOMATIC_TABS and strategy.automatic:
+                click_rule = publisher_pdf_click_rule(url)
+                uses_transient_download_tab = bool(
+                    click_rule and click_rule.direct_navigation
+                )
+                if (
+                    CLOSE_COMPLETED_AUTOMATIC_TABS
+                    and strategy.automatic
+                    and not uses_transient_download_tab
+                ):
                     close_completed_automatic_tab(url)
                 successful_downloads += 1
                 if (
