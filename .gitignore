@@ -2,4 +2,6 @@
 __pycache__
 browser*/
 target_records*.csv
+config.yaml
 test*
+download_events.jsonl

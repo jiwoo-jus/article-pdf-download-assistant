@@ -32,17 +32,28 @@ python -m pip install requests
 
 ## 2. Prepare `config.yaml`
 
-`ncbi_email` is required for PubMed metadata retrieval.
+Create `config.yaml` in the same folder as `fill_pubmed_metadata.py`.
 
-`ncbi_api_key` is optional but recommended.
+The easiest option is to copy the provided template:
 
-Replace the example values in your information.
+```bash
+cp config.template.yaml config.yaml
+```
+
+Fields:
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `ncbi_email` | Yes | Your contact email for NCBI E-utilities requests. |
+| `ncbi_api_key` | No | Your NCBI API key. Leave it as an empty string if you do not have one. |
 
 ---
 
 ## 3. Prepare `target_records.csv`
 
-The minimum input is a CSV with a `pmid` column:
+Create `target_records.csv` in the same folder as the two Python scripts.
+
+The minimum input is a CSV with a lowercase `pmid` column:
 
 ```csv
 pmid
