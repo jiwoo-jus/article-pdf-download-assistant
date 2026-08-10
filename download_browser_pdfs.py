@@ -4,6 +4,7 @@ import csv
 import json
 import os
 import random
+import re
 import select
 import shlex
 import shutil
@@ -78,6 +79,9 @@ class PublisherClickRule:
     direct_navigation: bool = False
     download_unavailable_statuses: tuple[int, ...] = ()
     download_ready_selector: str | None = None
+    public_host: str | None = None
+    proxy_host: str | None = None
+    click_timeout_seconds: int | None = None
 
 
 @dataclass(frozen=True)
@@ -217,20 +221,20 @@ WATCH_DIR = (Path.home() / "Downloads").resolve()
 OUTPUT_DIR = (PROJECT_ROOT / "browser").resolve()
 
 BATCH_START = 0
-BATCH_LIMIT = 2000
+BATCH_LIMIT = 3000
 # Rebuild each queued row's download_url from its DOI instead of reusing the
 # value already stored in the CSV.  This can repair stale or incomplete URLs
 # and retry DOI resolution after a transient failure.  Set to False when the
 # saved download_url values are known to be good.
 OVERRIDE_EXISTING_DOWNLOAD_URLS = False
-OPEN_DELAY_SECONDS = 1.5
-WAIT_TIMEOUT_SECONDS = 10
-POLL_INTERVAL_SECONDS = 1
+OPEN_DELAY_SECONDS = 5
+WAIT_TIMEOUT_SECONDS = 15
+POLL_INTERVAL_SECONDS = 2
 MIN_FILE_SIZE_BYTES = 1024
 INTERACTIVE_SKIP = True
 # Opt-in unattended mode. After the normal wait expires, a record is marked
 # skipped and the batch continues without asking for retry/skip input.
-AUTO_SKIP_MODE = False
+AUTO_SKIP_MODE = True
 # Publishers listed here retain the interactive retry/skip prompt even when
 # AUTO_SKIP_MODE is enabled. Names must match PublisherClickRule.publisher.
 AUTO_SKIP_PUBLISHER_EXCEPTIONS: set[str] = set()
@@ -239,7 +243,7 @@ OPEN_COMMAND: str | None = None
 # Append-only, machine-readable history for later failure-pattern analysis.
 BATCH_LOG_PATH: Path | None = PROJECT_ROOT / "download_events.jsonl"
 # Matching URLs are recorded as skipped instead of silently disappearing.
-BLOCKED_URL_PATTERNS = ["karger.com", "10.1159", "ashpublications.org", "ascopubs.org", "neurology.org", "auajournals.org", "10.1158", "ovid.com", "jamaoto", "jamaoncol", "eurekaselect.com", "ersnet.org", "10.23736", "degruyterbrill.com", "dustri.com"]
+BLOCKED_URL_PATTERNS = ["onlinelibrary-wiley-com", "pubs-acs-org", "10.1177", "link.springer.com", "karger.com", "10.1159", "ashpublications.org", "ascopubs.org", "neurology.org", "auajournals.org", "10.1158", "ovid.com", "jamaoto", "jamaoncol", "eurekaselect.com", "ersnet.org", "10.23736", "degruyterbrill.com", "dustri.com"]
 # Matching URLs remain in the queue but run in the manual-review tier.
 MANUAL_URL_PATTERNS = [] #"link.springer.com"
 AUTOMATE_PUBLISHER_PDF_CLICK = True
@@ -252,8 +256,8 @@ AUTO_CLEAR_BROWSER_CACHE = True
 CACHE_CLEAR_EVERY_FILES = 12
 CACHE_CLEAR_PUBLISHERS = ["ScienceDirect"]
 CLEAR_COOKIES_WITH_CACHE = True
-DOWNLOAD_BREAK_EVERY_FILES = 2000
-DOWNLOAD_BREAK_SECONDS = 60
+DOWNLOAD_BREAK_EVERY_FILES = 100
+DOWNLOAD_BREAK_SECONDS = 30
 SCIENCEDIRECT_REQUEST_ERROR_MAX_RETRIES = 3
 # Publisher circuits only use explicit response/block signals. Ordinary
 # timeouts, 401s, and 404s never disable an entire publisher.
@@ -291,14 +295,15 @@ CHROME_COOKIE_FILES = tuple(
 # publisher group, while all verified automatic routes stay ahead of records
 # that need manual review.
 AUTO_PUBLISHER_PRIORITY = {
-    "Springer Nature": 0,
-    "Wiley": 5,
-    "ACS": 10,
+    "Springer Nature": 1,
+    "Wiley": 148,
+    "ACS": 148,
     "ASCO Publications": 15,
     "Oxford Academic": 20,
-    "Taylor & Francis": 25,
-    "SAGE": 30,
+    "Taylor & Francis": 148,
+    "SAGE": 130,
     "RSC": 40,
+    "AMA Journal of Ethics": 45,
     "IOPscience": 70,
     "IIAR Journals": 80,
     "AACR Journals": 90,
@@ -314,7 +319,7 @@ AUTO_PUBLISHER_PRIORITY = {
     "PLOS": 145,
     "Oncotarget": 147,
     "ACP Journals": 149,
-    "ScienceDirect": 150,
+    "ScienceDirect": 0,
 }
 
 DIRECT_PDF_PRIORITY = 200
@@ -350,6 +355,21 @@ SAGE_ARTICLE_BASE_URL = f"https://{SAGE_PROXY_HOST}/doi/full"
 LIEBERT_ARTICLE_BASE_URL = "https://www.liebertpub.com/doi/pdf"
 TANDF_PROXY_HOST = "www-tandfonline-com.proxy.lib.ohio-state.edu"
 TANDF_ARTICLE_BASE_URL = f"https://{TANDF_PROXY_HOST}/doi/full"
+RSC_PUBLIC_HOST = "pubs.rsc.org"
+RSC_PROXY_HOST = "pubs-rsc-org.proxy.lib.ohio-state.edu"
+IOP_PUBLIC_HOST = "iopscience.iop.org"
+IOP_PROXY_HOST = "iopscience-iop-org.proxy.lib.ohio-state.edu"
+IOP_ARTICLE_BASE_URL = f"https://{IOP_PROXY_HOST}/article"
+RSC_ARTICLE_CODE_PATTERN = re.compile(
+    r"^(?P<decade>[a-d])(?P<year>\d)(?P<journal>[a-z]{2})[a-z0-9]+$",
+    re.IGNORECASE,
+)
+RSC_DECADE_START_YEARS = {
+    "a": 1990,
+    "b": 2000,
+    "c": 2010,
+    "d": 2020,
+}
 
 TEMP_SUFFIXES = {".crdownload", ".part", ".download", ".tmp"}
 
@@ -367,7 +387,7 @@ DOI_PREFIX_RULES: list[tuple[str, str]] = [
     ("10.1128/", "https://journals.asm.org/doi/pdf/{doi}"),
     ("10.1089/", f"{LIEBERT_ARTICLE_BASE_URL}/{{doi}}"),
     ("10.1080/", f"{TANDF_ARTICLE_BASE_URL}/{{doi}}"),
-    ("10.1088/", "https://iopscience.iop.org/article/{doi}"),
+    ("10.1088/", f"{IOP_ARTICLE_BASE_URL}/{{doi}}"),
 ]
 
 # When a network DOI lookup falls back to doi.org, these stable ownership
@@ -377,6 +397,7 @@ DOI_PREFIX_RULES: list[tuple[str, str]] = [
 DOI_REDIRECT_HOST_HINTS: list[tuple[str, str]] = [
     ("10.1016/", "www.sciencedirect.com"),
     ("10.1039/", "pubs.rsc.org"),
+    ("10.1001/amajethics.", "journalofethics.ama-assn.org"),
     ("10.1001/", "jamanetwork.com"),
     ("10.1093/", "academic.oup.com"),
     ("10.1097/", "www.ovid.com"),
@@ -472,6 +493,29 @@ def institutional_url_override(doi: str) -> str:
     return ""
 
 
+def rsc_proxy_article_url(doi: str) -> str:
+    """Build RSC's stable article-landing route from a standard article DOI."""
+    normalized = normalize_doi(doi)
+    prefix = "10.1039/"
+    if not normalized.casefold().startswith(prefix):
+        return ""
+
+    article_code = normalized[len(prefix):]
+    match = RSC_ARTICLE_CODE_PATTERN.fullmatch(article_code)
+    if not match:
+        return ""
+
+    decade_start = RSC_DECADE_START_YEARS.get(match.group("decade").casefold())
+    if decade_start is None:
+        return ""
+    year = decade_start + int(match.group("year"))
+    journal = match.group("journal").casefold()
+    return (
+        f"https://{RSC_PROXY_HOST}/en/content/articlelanding/"
+        f"{year}/{journal}/{article_code.casefold()}"
+    )
+
+
 def doi_from_doi_path(path: str) -> str:
     if "/doi/" not in path:
         return ""
@@ -512,6 +556,9 @@ def rewrite_resolved_url(url: str, fallback_doi: str = "") -> str:
 
     if host == "pubs.rsc.org" and "/articlelanding/" in path:
         return url.replace("/articlelanding/", "/articlepdf/")
+
+    if host == IOP_PUBLIC_HOST:
+        return parsed._replace(netloc=IOP_PROXY_HOST).geturl()
 
     if host == "elifesciences.org" and "/articles/" in path:
         article_id = path.split("/articles/", 1)[1].split("/", 1)[0]
@@ -594,6 +641,9 @@ def prepare_pdf_url_locally(doi: str) -> str:
     if doi.casefold().startswith("10.7554/elife."):
         article_id = doi.rsplit(".", 1)[-1]
         return f"https://elifesciences.org/articles/{article_id}.pdf"
+    rsc_url = rsc_proxy_article_url(doi)
+    if rsc_url:
+        return rsc_url
 
     for prefix, template in DOI_PREFIX_RULES:
         if doi.casefold().startswith(prefix.casefold()):
@@ -1375,8 +1425,22 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
         return PublisherClickRule(
             publisher="ACS",
             pdf_selector=(
+                'div.article-pdf-button-wrapper '
+                'a.article-pdfLink[href*="/article-pdf/"], '
+                'a.article-pdf-button[data-doctype="contentPdf"]'
+                '[href*="/article-pdf/"], '
+                'a.article-pdfLink[data-doctype="contentPdf"]'
+                '[href*="/article-pdf/"], '
                 'a[data-id="article_header_OpenPDF"][href*="/doi/pdf/"], '
                 'a.article__btn__secondary--pdf[href*="/doi/pdf/"]'
+            ),
+        )
+    if is_public_or_osu_proxy_host(host, "journalofethics.ama-assn.org"):
+        return PublisherClickRule(
+            publisher="AMA Journal of Ethics",
+            pdf_selector=(
+                'a[href*="/sites/joedb/files/"][href$=".pdf"], '
+                'a[href$=".pdf"]:has(> button[aria-label="Download PDF"])'
             ),
         )
     if is_public_or_osu_proxy_host(host, "ascopubs.org"):
@@ -1450,7 +1514,7 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
                 'a[aria-label^="Download PDF"][href*="/doi/pdf/"]'
             ),
         )
-    if host == "pubs.rsc.org" or host.endswith(
+    if host == RSC_PUBLIC_HOST or host.endswith(
         "-rsc-org.proxy.lib.ohio-state.edu"
     ):
         return PublisherClickRule(
@@ -1459,6 +1523,14 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
                 'a.article-pdfLink[href*="/article-pdf/"], '
                 'a[data-doctype="contentPdf"][href*="/article-pdf/"]'
             ),
+            # DOI fallbacks resolve in Chrome to the public RSC article URL,
+            # which may omit the PDF control. Reopen that exact route through
+            # EZproxy so its authenticated toolbar can be clicked.
+            public_host=RSC_PUBLIC_HOST,
+            proxy_host=RSC_PROXY_HOST,
+            # Retain a generous fallback for old/non-article RSC DOIs that
+            # cannot use the deterministic article-landing URL above.
+            click_timeout_seconds=90,
         )
     if is_tandfonline_host(host):
         return PublisherClickRule(
@@ -1482,11 +1554,13 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
         return PublisherClickRule(
             publisher="Oxford Academic",
             pdf_selector=(
+                'li.item-pdf a.article-pdfLink[href*="/advance-article-pdf/"], '
+                'a.article-pdfLink[href*="/advance-article-pdf/"], '
                 'li.item-pdf a.article-pdfLink[href*="/article-pdf/"], '
                 'a.article-pdfLink[href*="/article-pdf/"]'
             ),
         )
-    if host == "iopscience.iop.org" or host.endswith(
+    if host == IOP_PUBLIC_HOST or host.endswith(
         "-iop-org.proxy.lib.ohio-state.edu"
     ):
         return PublisherClickRule(
@@ -1495,6 +1569,8 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
                 'a.content-download[href*="/article/"][href$="/pdf"], '
                 'a[itemprop="sameAs"][href$="/pdf"]'
             ),
+            public_host=IOP_PUBLIC_HOST,
+            proxy_host=IOP_PROXY_HOST,
         )
     if is_public_or_osu_proxy_host(host, "iiarjournals.org"):
         return PublisherClickRule(
@@ -1707,6 +1783,9 @@ def open_publisher_and_click_pdf(
     direct_navigation: bool = False,
     download_unavailable_statuses: tuple[int, ...] = (),
     download_ready_selector: str | None = None,
+    public_host: str | None = None,
+    proxy_host: str | None = None,
+    configured_click_timeout_seconds: int | None = None,
 ) -> PublisherOpenResult:
     """Open a publisher article and click through to its final PDF download."""
     if sys.platform != "darwin" or not shutil.which("osascript"):
@@ -1715,7 +1794,12 @@ def open_publisher_and_click_pdf(
             detail="Chrome AppleScript automation is unavailable",
         )
 
-    attempts = max(1, int(PUBLISHER_CLICK_TIMEOUT_SECONDS / 0.5))
+    # A proxy handoff performs one additional top-level page load. Give that
+    # route its own small allowance without slowing ordinary publisher rules.
+    click_timeout_seconds = configured_click_timeout_seconds or (
+        PUBLISHER_CLICK_TIMEOUT_SECONDS + (10 if public_host and proxy_host else 0)
+    )
+    attempts = max(1, int(click_timeout_seconds / 0.5))
     javascript = r"""
 (() => {
   const downloadSelector = __DOWNLOAD_SELECTOR__;
@@ -1729,9 +1813,18 @@ def open_publisher_and_click_pdf(
   const directNavigation = __DIRECT_NAVIGATION__;
   const downloadUnavailableStatuses = __DOWNLOAD_UNAVAILABLE_STATUSES__;
   const downloadReadySelector = __DOWNLOAD_READY_SELECTOR__;
+  const publicHost = __PUBLIC_HOST__;
+  const proxyHost = __PROXY_HOST__;
   const navigationEntry = performance.getEntriesByType('navigation')[0];
   const responseStatus = Number(navigationEntry?.responseStatus || 0);
   if (responseStatus >= 400) return `http_error:${responseStatus}`;
+
+  if (publicHost && proxyHost && window.location.hostname === publicHost) {
+    const proxyUrl = new URL(window.location.href);
+    proxyUrl.hostname = proxyHost;
+    window.location.replace(proxyUrl.href);
+    return 'proxy_navigation_started';
+  }
   if (requestErrorSelector && requestErrorText) {
     const requestError = document.querySelector(requestErrorSelector);
     const normalizedErrorText = requestError?.textContent
@@ -1862,6 +1955,12 @@ def open_publisher_and_click_pdf(
         "__DOWNLOAD_READY_SELECTOR__",
         json.dumps(download_ready_selector),
     ).replace(
+        "__PUBLIC_HOST__",
+        json.dumps(public_host),
+    ).replace(
+        "__PROXY_HOST__",
+        json.dumps(proxy_host),
+    ).replace(
         "__PDF_SELECTOR__", json.dumps(selector)
     ).strip()
     apple_script = f"""
@@ -1876,6 +1975,7 @@ on run argv
         set directNavigation to {str(direct_navigation).lower()}
         set pdfPageOpened to false
         set popupDismissed to false
+        set proxyNavigationStarted to false
         set monitoredDownloadChecksRemaining to 0
         set lastJavaScriptError to ""
 
@@ -1886,6 +1986,7 @@ on run argv
                 if clickResult is "request_blocked" then return "request_blocked"
                 if clickResult is "download_unavailable" then return "download_unavailable"
                 if clickResult is "navigation_complete" then return "navigation_complete"
+                if clickResult is "proxy_navigation_started" then set proxyNavigationStarted to true
                 if clickResult starts with "navigate_epdf:" then
                     set epdfUrl to text 15 thru -1 of clickResult
                     set URL of articleTab to epdfUrl
@@ -1898,6 +1999,7 @@ on run argv
                 end if
                 if clickResult is "download_clicked" then
                     if popupDismissed then return "download_clicked_after_popup"
+                    if proxyNavigationStarted then return "download_clicked_after_proxy"
                     return "download_clicked"
                 end if
                 if clickResult is "download_clicked_monitoring" then
@@ -1937,7 +2039,7 @@ end run
             check=False,
             capture_output=True,
             text=True,
-            timeout=PUBLISHER_CLICK_TIMEOUT_SECONDS + 10,
+            timeout=click_timeout_seconds + 10,
         )
     except subprocess.TimeoutExpired:
         print(
@@ -2001,9 +2103,15 @@ end run
         print(f"  [AUTO-PDF] {publisher} direct PDF request started")
         return PublisherOpenResult(PublisherOpenStatus.OPENED)
 
-    if status in {"download_clicked", "download_clicked_after_popup"}:
+    if status in {
+        "download_clicked",
+        "download_clicked_after_popup",
+        "download_clicked_after_proxy",
+    }:
         if status == "download_clicked_after_popup":
             print(f"  [AUTO-PDF] dismissed {publisher} popup")
+        if status == "download_clicked_after_proxy":
+            print(f"  [AUTO-PDF] routed {publisher} through institutional proxy")
         print(f"  [AUTO-PDF] clicked {publisher} PDF download")
         return PublisherOpenResult(PublisherOpenStatus.OPENED)
 
@@ -2047,19 +2155,28 @@ def open_url(url: str) -> PublisherOpenResult:
         click_rule = publisher_pdf_click_rule(url)
         if click_rule and (strategy.automatic or click_rule.direct_navigation):
             open_status = open_publisher_and_click_pdf(
-                url,
-                click_rule.publisher,
-                click_rule.pdf_selector,
-                click_rule.download_selector,
-                click_rule.reveal_download_selector,
-                click_rule.dismiss_selector,
-                click_rule.request_error_selector,
-                click_rule.request_error_text,
-                click_rule.download_unavailable_selector,
-                click_rule.download_unavailable_texts,
-                click_rule.direct_navigation,
-                click_rule.download_unavailable_statuses,
-                click_rule.download_ready_selector,
+                url=url,
+                publisher=click_rule.publisher,
+                selector=click_rule.pdf_selector,
+                download_selector=click_rule.download_selector,
+                reveal_download_selector=click_rule.reveal_download_selector,
+                dismiss_selector=click_rule.dismiss_selector,
+                request_error_selector=click_rule.request_error_selector,
+                request_error_text=click_rule.request_error_text,
+                download_unavailable_selector=(
+                    click_rule.download_unavailable_selector
+                ),
+                download_unavailable_texts=click_rule.download_unavailable_texts,
+                direct_navigation=click_rule.direct_navigation,
+                download_unavailable_statuses=(
+                    click_rule.download_unavailable_statuses
+                ),
+                download_ready_selector=click_rule.download_ready_selector,
+                public_host=click_rule.public_host,
+                proxy_host=click_rule.proxy_host,
+                configured_click_timeout_seconds=(
+                    click_rule.click_timeout_seconds
+                ),
             )
             if open_status.status is not PublisherOpenStatus.AUTOMATION_FAILED:
                 return open_status
@@ -2315,12 +2432,22 @@ def build_queue(
     for index, (row, pmid, doi) in enumerate(selected, start=1):
         existing_url = normalize_cell(row.get(DOWNLOAD_URL_COLUMN))
         override_url = institutional_url_override(doi)
+        rsc_url = rsc_proxy_article_url(doi)
+        repaired_existing_url = (
+            rewrite_resolved_url(existing_url, fallback_doi=doi)
+            if is_http_url(existing_url)
+            else existing_url
+        )
         if override_url:
             planned_action = "institutional override"
         elif OVERRIDE_EXISTING_DOWNLOAD_URLS and existing_url:
             planned_action = "refresh existing URL"
         elif OVERRIDE_EXISTING_DOWNLOAD_URLS:
             planned_action = "resolve DOI"
+        elif is_doi_resolver_url(existing_url) and rsc_url:
+            planned_action = "repair RSC DOI URL"
+        elif repaired_existing_url != existing_url:
+            planned_action = "repair existing URL"
         elif is_http_url(existing_url):
             planned_action = "reuse existing URL"
         else:
@@ -2354,6 +2481,14 @@ def build_queue(
                 )
                 if existing_url and url != existing_url:
                     print(f"  [REFRESH URL] {existing_url} -> {url}")
+        elif is_doi_resolver_url(existing_url) and rsc_url:
+            url = rsc_url
+            action = "repaired"
+            print(f"  [REPAIR URL] {existing_url} -> {url}")
+        elif repaired_existing_url != existing_url:
+            url = repaired_existing_url
+            action = "repaired"
+            print(f"  [REPAIR URL] {existing_url} -> {url}")
         elif is_http_url(existing_url):
             url = existing_url
             action = "reused"
@@ -2370,7 +2505,7 @@ def build_queue(
         blocked_pattern = matching_blocked_pattern(url)
         if blocked_pattern:
             blocked_count += 1
-            print(f"  [SKIP URL] pmid={pmid} pattern={blocked_pattern} url={url}")
+            print(f"  [SKIP URL] pmid= {pmid} pattern={blocked_pattern} url={url}")
             failure = FailureDetails(
                 category="configured_skip",
                 code="blocked_url_pattern",
@@ -2525,7 +2660,7 @@ def main() -> int:
         url = normalize_cell(row.get(DOWNLOAD_URL_COLUMN))
         destination = OUTPUT_DIR / f"{pmid}.pdf"
 
-        print(f"\n[{position}/{len(queue)}] pmid={pmid}")
+        print(f"\n[{position}/{len(queue)}] pmid= {pmid}")
 
         if destination.exists() and is_pdf_file(destination):
             print(f"  [SKIP] already exists: {destination.name}")
