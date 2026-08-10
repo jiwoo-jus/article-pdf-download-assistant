@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import random
 import select
 import shlex
 import shutil
@@ -11,7 +12,8 @@ import sys
 import time
 import webbrowser
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from enum import Enum
 from pathlib import Path
 from typing import Iterable, Mapping
@@ -21,6 +23,7 @@ from urllib.request import Request, urlopen
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+RUN_ID = datetime.now().astimezone().strftime("%Y%m%dT%H%M%S%z")
 
 PMID_COLUMN = "pmid"
 DOI_COLUMN = "doi"
@@ -28,6 +31,13 @@ IS_FETCH_TARGET_COLUMN = "is_fetch_target"
 FETCH_STATUS_COLUMN = "fetch_status"
 FETCH_SOURCE_COLUMN = "fetch_source"
 FETCH_ERROR_COLUMN = "fetch_error"
+FETCH_ERROR_CATEGORY_COLUMN = "fetch_error_category"
+FETCH_ERROR_CODE_COLUMN = "fetch_error_code"
+FETCH_ERROR_DETAIL_COLUMN = "fetch_error_detail"
+FETCH_ERROR_RETRYABLE_COLUMN = "fetch_error_retryable"
+FETCH_ERROR_ACTION_COLUMN = "fetch_error_action"
+FETCH_PUBLISHER_COLUMN = "fetch_publisher"
+FETCH_PUBLISHER_FAILURE_COUNT_COLUMN = "fetch_publisher_failure_count"
 DOWNLOAD_STARTED_AT_COLUMN = "download_started_at"
 DOWNLOAD_FINISHED_AT_COLUMN = "download_finished_at"
 DOWNLOAD_FILENAME_COLUMN = "download_filename"
@@ -39,6 +49,13 @@ DOWNLOAD_RESULT_FIELDS = [
     FETCH_STATUS_COLUMN,
     FETCH_SOURCE_COLUMN,
     FETCH_ERROR_COLUMN,
+    FETCH_ERROR_CATEGORY_COLUMN,
+    FETCH_ERROR_CODE_COLUMN,
+    FETCH_ERROR_DETAIL_COLUMN,
+    FETCH_ERROR_RETRYABLE_COLUMN,
+    FETCH_ERROR_ACTION_COLUMN,
+    FETCH_PUBLISHER_COLUMN,
+    FETCH_PUBLISHER_FAILURE_COUNT_COLUMN,
     DOWNLOAD_STARTED_AT_COLUMN,
     DOWNLOAD_FINISHED_AT_COLUMN,
     DOWNLOAD_FILENAME_COLUMN,
@@ -81,6 +98,32 @@ class PublisherOpenStatus(Enum):
     REQUEST_BLOCKED = "request_blocked"
     DOWNLOAD_UNAVAILABLE = "download_unavailable"
     AUTOMATION_FAILED = "automation_failed"
+    HTTP_ERROR = "http_error"
+
+
+@dataclass(frozen=True)
+class PublisherOpenResult:
+    status: PublisherOpenStatus
+    http_status: int | None = None
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class FailureDetails:
+    category: str
+    code: str
+    detail: str
+    retryable: bool
+    recommended_action: str
+
+
+@dataclass(frozen=True)
+class PublisherCircuit:
+    publisher: str
+    signal: str
+    failure_count: int
+    threshold: int
+    opened_at: str
 
 
 def ensure_directory(path: Path) -> None:
@@ -185,15 +228,26 @@ WAIT_TIMEOUT_SECONDS = 10
 POLL_INTERVAL_SECONDS = 1
 MIN_FILE_SIZE_BYTES = 1024
 INTERACTIVE_SKIP = True
+# Opt-in unattended mode. After the normal wait expires, a record is marked
+# skipped and the batch continues without asking for retry/skip input.
+AUTO_SKIP_MODE = False
+# Publishers listed here retain the interactive retry/skip prompt even when
+# AUTO_SKIP_MODE is enabled. Names must match PublisherClickRule.publisher.
+AUTO_SKIP_PUBLISHER_EXCEPTIONS: set[str] = set()
 DRY_RUN = False
 OPEN_COMMAND: str | None = None
-BATCH_LOG_PATH: Path | None = None
+# Append-only, machine-readable history for later failure-pattern analysis.
+BATCH_LOG_PATH: Path | None = PROJECT_ROOT / "download_events.jsonl"
 # Matching URLs are recorded as skipped instead of silently disappearing.
 BLOCKED_URL_PATTERNS = ["karger.com", "10.1159", "ashpublications.org", "ascopubs.org", "neurology.org", "auajournals.org", "10.1158", "ovid.com", "jamaoto", "jamaoncol", "eurekaselect.com", "ersnet.org", "10.23736", "degruyterbrill.com", "dustri.com"]
 # Matching URLs remain in the queue but run in the manual-review tier.
 MANUAL_URL_PATTERNS = [] #"link.springer.com"
 AUTOMATE_PUBLISHER_PDF_CLICK = True
 PUBLISHER_CLICK_TIMEOUT_SECONDS = 20
+DOI_RESOLUTION_MIN_INTERVAL_SECONDS = 1.5
+DOI_RESOLUTION_JITTER_SECONDS = 0.75
+DOI_RESOLUTION_DEFAULT_RATE_LIMIT_PAUSE_SECONDS = 60
+DOI_RESOLUTION_MAX_RETRY_AFTER_SECONDS = 300
 AUTO_CLEAR_BROWSER_CACHE = True
 CACHE_CLEAR_EVERY_FILES = 12
 CACHE_CLEAR_PUBLISHERS = ["ScienceDirect"]
@@ -201,6 +255,16 @@ CLEAR_COOKIES_WITH_CACHE = True
 DOWNLOAD_BREAK_EVERY_FILES = 2000
 DOWNLOAD_BREAK_SECONDS = 60
 SCIENCEDIRECT_REQUEST_ERROR_MAX_RETRIES = 3
+# Publisher circuits only use explicit response/block signals. Ordinary
+# timeouts, 401s, and 404s never disable an entire publisher.
+PUBLISHER_CIRCUIT_THRESHOLDS = {
+    "http_429": 3,
+    "request_blocked": 3,
+    "http_403": 4,
+    "http_502": 4,
+    "http_503": 4,
+    "http_504": 4,
+}
 CLOSE_COMPLETED_AUTOMATIC_TABS = True
 CLOSE_SCIENCEDIRECT_TABS_AT_BREAK = True
 CHROME_PROFILE_DIRECTORY = "Default"
@@ -311,6 +375,8 @@ DOI_PREFIX_RULES: list[tuple[str, str]] = [
 # follows the redirect. They also let blocked publisher domains match before
 # the browser opens the DOI URL.
 DOI_REDIRECT_HOST_HINTS: list[tuple[str, str]] = [
+    ("10.1016/", "www.sciencedirect.com"),
+    ("10.1039/", "pubs.rsc.org"),
     ("10.1001/", "jamanetwork.com"),
     ("10.1093/", "academic.oup.com"),
     ("10.1097/", "www.ovid.com"),
@@ -322,6 +388,7 @@ DOI_REDIRECT_HOST_HINTS: list[tuple[str, str]] = [
     ("10.1182/", "ashpublications.org"),
     ("10.1212/", "www.neurology.org"),
     ("10.1371/", "journals.plos.org"),
+    ("10.1177/", "journals.sagepub.com"),
     ("10.1086/340133", "academic.oup.com"),
     ("10.1634/", "academic.oup.com"),
     ("10.18632/", "www.oncotarget.com"),
@@ -513,7 +580,12 @@ def rewrite_resolved_url(url: str, fallback_doi: str = "") -> str:
     return url
 
 
-def resolve_best_pdf_url(doi: str, resolve_timeout: float = 8.0) -> str:
+_last_doi_resolution_request_at = 0.0
+_doi_resolution_cooldown_until = 0.0
+
+
+def prepare_pdf_url_locally(doi: str) -> str:
+    """Build the best available URL without making any network request."""
     doi = normalize_doi(doi)
     if not doi:
         return ""
@@ -527,11 +599,65 @@ def resolve_best_pdf_url(doi: str, resolve_timeout: float = 8.0) -> str:
         if doi.casefold().startswith(prefix.casefold()):
             return template.format(doi=encoded_doi(doi))
 
-    doi_url = f"https://doi.org/{encoded_doi(doi)}"
+    return f"https://doi.org/{encoded_doi(doi)}"
+
+
+def retry_after_seconds(exc: HTTPError) -> float | None:
+    value = normalize_cell(exc.headers.get("Retry-After") if exc.headers else "")
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+
+
+def wait_for_doi_resolution_slot() -> bool:
+    """Pace DOI lookups and wait out any server-requested cooldown."""
+    global _last_doi_resolution_request_at
+    now = time.monotonic()
+    if now < _doi_resolution_cooldown_until:
+        remaining = _doi_resolution_cooldown_until - now
+        print(
+            f"  [RESOLVE PAUSED] waiting {remaining:.1f}s before more DOI traffic",
+            flush=True,
+        )
+        time.sleep(remaining)
+        now = time.monotonic()
+
+    minimum_gap = DOI_RESOLUTION_MIN_INTERVAL_SECONDS + random.uniform(
+        0.0,
+        DOI_RESOLUTION_JITTER_SECONDS,
+    )
+    elapsed = now - _last_doi_resolution_request_at
+    if _last_doi_resolution_request_at and elapsed < minimum_gap:
+        time.sleep(minimum_gap - elapsed)
+    _last_doi_resolution_request_at = time.monotonic()
+    return True
+
+
+def resolve_best_pdf_url(doi: str, resolve_timeout: float = 8.0) -> str:
+    """Resolve one DOI lazily; local rules never generate network traffic."""
+    global _doi_resolution_cooldown_until
+    doi = normalize_doi(doi)
+    prepared_url = prepare_pdf_url_locally(doi)
+    if not prepared_url or not is_doi_resolver_url(prepared_url):
+        return prepared_url
+
+    doi_url = prepared_url
     errors: list[str] = []
     resolved = ""
     resolved_method = ""
     for method in ("HEAD", "GET"):
+        if not wait_for_doi_resolution_slot():
+            errors.append("lookup paused after HTTP 429")
+            break
         try:
             request = Request(
                 doi_url,
@@ -547,11 +673,51 @@ def resolve_best_pdf_url(doi: str, resolve_timeout: float = 8.0) -> str:
             break
         except (HTTPError, URLError, TimeoutError, OSError) as exc:
             errors.append(f"{method} {describe_resolution_error(exc)}")
+            if isinstance(exc, HTTPError):
+                if exc.code == 429:
+                    requested_pause = retry_after_seconds(exc)
+                    pause_seconds = (
+                        DOI_RESOLUTION_DEFAULT_RATE_LIMIT_PAUSE_SECONDS
+                        if requested_pause is None
+                        else min(requested_pause, DOI_RESOLUTION_MAX_RETRY_AFTER_SECONDS)
+                    )
+                    _doi_resolution_cooldown_until = max(
+                        _doi_resolution_cooldown_until,
+                        time.monotonic() + pause_seconds,
+                    )
+                    print(
+                        f"  [RESOLVE RATE LIMIT] pausing DOI lookups for "
+                        f"{pause_seconds:.0f}s"
+                    )
+                    break
+                # Do not turn a rejected HEAD into a second publisher request.
+                # GET fallback is reserved for servers that reject HEAD itself.
+                if exc.code not in {405, 501}:
+                    break
+            elif method == "HEAD":
+                # Network errors and timeouts should not be doubled immediately.
+                break
 
     if not resolved:
+        if time.monotonic() < _doi_resolution_cooldown_until:
+            remaining = _doi_resolution_cooldown_until - time.monotonic()
+            print(
+                f"  [RESOLVE PAUSED] waiting {remaining:.1f}s before browser fallback",
+                flush=True,
+            )
+            time.sleep(remaining)
         print(
             f"  [RESOLVE FALLBACK] {'; '.join(errors)}; "
             f"using {doi_url}"
+        )
+        log_event(
+            {
+                "event": "doi_resolution_failed",
+                "doi": doi,
+                "url": doi_url,
+                "errors": errors,
+                "action": "open DOI URL in browser without another resolver request",
+            }
         )
         return doi_url
 
@@ -559,6 +725,16 @@ def resolve_best_pdf_url(doi: str, resolve_timeout: float = 8.0) -> str:
     rewritten = rewrite_resolved_url(resolved, fallback_doi=doi)
     if rewritten != resolved:
         print(f"  [REWRITE] -> {rewritten}")
+    log_event(
+        {
+            "event": "doi_resolved",
+            "doi": doi,
+            "method": resolved_method,
+            "resolver_url": doi_url,
+            "resolved_url": resolved,
+            "rewritten_url": rewritten,
+        }
+    )
     return rewritten
 
 
@@ -722,9 +898,13 @@ def wait_for_download(
 def log_event(payload: Mapping[str, object]) -> None:
     if BATCH_LOG_PATH is None:
         return
+    event = dict(payload)
+    event.setdefault("schema_version", 1)
+    event.setdefault("run_id", RUN_ID)
+    event.setdefault("recorded_at", now_timestamp())
     BATCH_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with BATCH_LOG_PATH.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
 
 
 def chrome_is_running() -> bool:
@@ -1527,10 +1707,13 @@ def open_publisher_and_click_pdf(
     direct_navigation: bool = False,
     download_unavailable_statuses: tuple[int, ...] = (),
     download_ready_selector: str | None = None,
-) -> PublisherOpenStatus:
+) -> PublisherOpenResult:
     """Open a publisher article and click through to its final PDF download."""
     if sys.platform != "darwin" or not shutil.which("osascript"):
-        return PublisherOpenStatus.AUTOMATION_FAILED
+        return PublisherOpenResult(
+            PublisherOpenStatus.AUTOMATION_FAILED,
+            detail="Chrome AppleScript automation is unavailable",
+        )
 
     attempts = max(1, int(PUBLISHER_CLICK_TIMEOUT_SECONDS / 0.5))
     javascript = r"""
@@ -1546,6 +1729,9 @@ def open_publisher_and_click_pdf(
   const directNavigation = __DIRECT_NAVIGATION__;
   const downloadUnavailableStatuses = __DOWNLOAD_UNAVAILABLE_STATUSES__;
   const downloadReadySelector = __DOWNLOAD_READY_SELECTOR__;
+  const navigationEntry = performance.getEntriesByType('navigation')[0];
+  const responseStatus = Number(navigationEntry?.responseStatus || 0);
+  if (responseStatus >= 400) return `http_error:${responseStatus}`;
   if (requestErrorSelector && requestErrorText) {
     const requestError = document.querySelector(requestErrorSelector);
     const normalizedErrorText = requestError?.textContent
@@ -1557,8 +1743,6 @@ def open_publisher_and_click_pdf(
   }
 
   if (downloadUnavailableStatuses.length > 0) {
-    const navigationEntry = performance.getEntriesByType('navigation')[0];
-    const responseStatus = Number(navigationEntry?.responseStatus || 0);
     if (downloadUnavailableStatuses.includes(responseStatus)) {
       return 'download_unavailable';
     }
@@ -1760,62 +1944,103 @@ end run
             f"  [AUTO-PDF] {publisher} status check timed out; "
             "the PDF click may already have started"
         )
-        return PublisherOpenStatus.AUTOMATION_FAILED
+        return PublisherOpenResult(
+            PublisherOpenStatus.AUTOMATION_FAILED,
+            detail="publisher click status check timed out",
+        )
     except OSError as exc:
         print(f"  [AUTO-PDF] Chrome automation unavailable: {exc}")
-        return PublisherOpenStatus.AUTOMATION_FAILED
+        return PublisherOpenResult(
+            PublisherOpenStatus.AUTOMATION_FAILED,
+            detail=f"Chrome automation unavailable: {exc}",
+        )
 
     status = result.stdout.strip()
+    if status.startswith("http_error:"):
+        try:
+            http_status = int(status.partition(":")[2])
+        except ValueError:
+            http_status = 0
+        print(f"  [AUTO-PDF] {publisher} returned HTTP {http_status}", flush=True)
+        result_status = (
+            PublisherOpenStatus.DOWNLOAD_UNAVAILABLE
+            if http_status in download_unavailable_statuses
+            else PublisherOpenStatus.HTTP_ERROR
+        )
+        return PublisherOpenResult(
+            result_status,
+            http_status=http_status or None,
+            detail=f"top-level browser navigation returned HTTP {http_status}",
+        )
+
     if status == "request_blocked":
         print(
             f"  [AUTO-PDF] detected {publisher} request-limit error page",
             flush=True,
         )
-        return PublisherOpenStatus.REQUEST_BLOCKED
+        return PublisherOpenResult(
+            PublisherOpenStatus.REQUEST_BLOCKED,
+            detail=request_error_text or "publisher request-block page detected",
+        )
 
     if status == "download_unavailable":
         print(
             f"  [AUTO-PDF] {publisher} reports that PDF downloading is unavailable",
             flush=True,
         )
-        return PublisherOpenStatus.DOWNLOAD_UNAVAILABLE
+        return PublisherOpenResult(
+            PublisherOpenStatus.DOWNLOAD_UNAVAILABLE,
+            detail="publisher page reports that PDF downloading is unavailable",
+        )
 
     if status == "navigation_complete":
         print(f"  [AUTO-PDF] checked {publisher} access state")
-        return PublisherOpenStatus.OPENED
+        return PublisherOpenResult(PublisherOpenStatus.OPENED)
 
     if status == "navigation_started":
         print(f"  [AUTO-PDF] {publisher} direct PDF request started")
-        return PublisherOpenStatus.OPENED
+        return PublisherOpenResult(PublisherOpenStatus.OPENED)
 
     if status in {"download_clicked", "download_clicked_after_popup"}:
         if status == "download_clicked_after_popup":
             print(f"  [AUTO-PDF] dismissed {publisher} popup")
         print(f"  [AUTO-PDF] clicked {publisher} PDF download")
-        return PublisherOpenStatus.OPENED
+        return PublisherOpenResult(PublisherOpenStatus.OPENED)
 
     if status.startswith("javascript_error:"):
         print("  [AUTO-PDF] article opened, but Chrome blocked the automatic click")
         print("  [AUTO-PDF] enable View > Developer > Allow JavaScript from Apple Events")
-        return PublisherOpenStatus.OPENED
+        return PublisherOpenResult(
+            PublisherOpenStatus.OPENED,
+            detail="Chrome blocked JavaScript from Apple Events",
+        )
 
     if status == "view_pdf_not_found":
         print(f"  [AUTO-PDF] {publisher} PDF link was not found; article left open")
-        return PublisherOpenStatus.OPENED
+        return PublisherOpenResult(
+            PublisherOpenStatus.OPENED,
+            detail="publisher PDF link was not found",
+        )
 
     if status == "download_link_not_found":
         print(f"  [AUTO-PDF] {publisher} PDF opened, but its download link was not found")
-        return PublisherOpenStatus.OPENED
+        return PublisherOpenResult(
+            PublisherOpenStatus.OPENED,
+            detail="PDF page opened but its download link was not found",
+        )
 
     error = result.stderr.strip() or status or f"osascript exited {result.returncode}"
     print(f"  [AUTO-PDF] Chrome automation failed: {error}")
-    return PublisherOpenStatus.AUTOMATION_FAILED
+    return PublisherOpenResult(
+        PublisherOpenStatus.AUTOMATION_FAILED,
+        detail=error,
+    )
 
 
-def open_url(url: str) -> PublisherOpenStatus:
+def open_url(url: str) -> PublisherOpenResult:
     if OPEN_COMMAND:
         subprocess.run([*shlex.split(OPEN_COMMAND), url], check=False)
-        return PublisherOpenStatus.OPENED
+        return PublisherOpenResult(PublisherOpenStatus.OPENED)
 
     if AUTOMATE_PUBLISHER_PDF_CLICK:
         strategy = download_strategy(url)
@@ -1836,11 +2061,11 @@ def open_url(url: str) -> PublisherOpenStatus:
                 click_rule.download_unavailable_statuses,
                 click_rule.download_ready_selector,
             )
-            if open_status is not PublisherOpenStatus.AUTOMATION_FAILED:
+            if open_status.status is not PublisherOpenStatus.AUTOMATION_FAILED:
                 return open_status
 
     webbrowser.open_new_tab(url)
-    return PublisherOpenStatus.OPENED
+    return PublisherOpenResult(PublisherOpenStatus.OPENED)
 
 
 def existing_pdf_path(pmid: str) -> Path | None:
@@ -1850,6 +2075,82 @@ def existing_pdf_path(pmid: str) -> Path | None:
 
 def now_timestamp() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def publisher_name_for_url(url: str) -> str:
+    click_rule = publisher_pdf_click_rule(url)
+    if click_rule:
+        return click_rule.publisher
+    return (urlparse(url).hostname or "unknown publisher").casefold()
+
+
+def failure_for_http_status(http_status: int, detail: str = "") -> FailureDetails:
+    descriptions = {
+        401: ("authentication", False, "refresh institutional login, then retry manually"),
+        403: ("access_denied", False, "pause this publisher and review access or blocking"),
+        404: ("not_found", False, "verify this article URL or DOI manually"),
+        429: ("rate_limited", True, "pause this publisher before retrying"),
+        502: ("publisher_server_error", True, "pause and retry this publisher later"),
+        503: ("publisher_unavailable", True, "pause and retry this publisher later"),
+        504: ("publisher_timeout", True, "pause and retry this publisher later"),
+    }
+    category, retryable, action = descriptions.get(
+        http_status,
+        (
+            "http_client_error" if 400 <= http_status < 500 else "http_server_error",
+            http_status >= 500,
+            "review the publisher response before retrying",
+        ),
+    )
+    return FailureDetails(
+        category=category,
+        code=f"http_{http_status}",
+        detail=detail or f"publisher returned HTTP {http_status}",
+        retryable=retryable,
+        recommended_action=action,
+    )
+
+
+def should_auto_skip_timeout(publisher: str) -> bool:
+    exceptions = {name.casefold() for name in AUTO_SKIP_PUBLISHER_EXCEPTIONS}
+    return AUTO_SKIP_MODE and publisher.casefold() not in exceptions
+
+
+def circuit_signal_for_failure(failure: FailureDetails) -> str:
+    return failure.code if failure.code in PUBLISHER_CIRCUIT_THRESHOLDS else ""
+
+
+def record_publisher_failure(
+    publisher: str,
+    failure: FailureDetails,
+    consecutive_failures: dict[str, tuple[str, int]],
+) -> PublisherCircuit | None:
+    """Count only consecutive, explicit block/HTTP signals for one publisher."""
+    signal = circuit_signal_for_failure(failure)
+    if not signal:
+        consecutive_failures.pop(publisher, None)
+        return None
+
+    previous_signal, previous_count = consecutive_failures.get(publisher, ("", 0))
+    count = previous_count + 1 if previous_signal == signal else 1
+    consecutive_failures[publisher] = (signal, count)
+    threshold = PUBLISHER_CIRCUIT_THRESHOLDS[signal]
+    if count < threshold:
+        return None
+    return PublisherCircuit(
+        publisher=publisher,
+        signal=signal,
+        failure_count=count,
+        threshold=threshold,
+        opened_at=now_timestamp(),
+    )
+
+
+def reset_publisher_failures(
+    publisher: str,
+    consecutive_failures: dict[str, tuple[str, int]],
+) -> None:
+    consecutive_failures.pop(publisher, None)
 
 
 def write_result(
@@ -1863,6 +2164,9 @@ def write_result(
     filename: str = "",
     url: str = "",
     output_path: str = "",
+    publisher: str = "",
+    failure: FailureDetails | None = None,
+    publisher_failure_count: int = 0,
 ) -> None:
     """Write a complete result state, clearing fields from any prior attempt."""
     row.update(
@@ -1870,6 +2174,17 @@ def write_result(
             FETCH_STATUS_COLUMN: status,
             FETCH_SOURCE_COLUMN: source,
             FETCH_ERROR_COLUMN: error,
+            FETCH_ERROR_CATEGORY_COLUMN: failure.category if failure else "",
+            FETCH_ERROR_CODE_COLUMN: failure.code if failure else "",
+            FETCH_ERROR_DETAIL_COLUMN: failure.detail if failure else "",
+            FETCH_ERROR_RETRYABLE_COLUMN: (
+                "Y" if failure and failure.retryable else "N" if failure else ""
+            ),
+            FETCH_ERROR_ACTION_COLUMN: failure.recommended_action if failure else "",
+            FETCH_PUBLISHER_COLUMN: publisher,
+            FETCH_PUBLISHER_FAILURE_COUNT_COLUMN: (
+                str(publisher_failure_count) if publisher_failure_count else ""
+            ),
             DOWNLOAD_STARTED_AT_COLUMN: started_at,
             DOWNLOAD_FINISHED_AT_COLUMN: finished_at,
             DOWNLOAD_FILENAME_COLUMN: filename,
@@ -1894,19 +2209,51 @@ def build_queue(
             continue
         pmid = normalize_pmid(raw_pmid)
         if not pmid:
+            failure = FailureDetails(
+                category="validation",
+                code="invalid_pmid",
+                detail=f"PMID must contain ASCII digits only: {raw_pmid!r}",
+                retryable=False,
+                recommended_action="correct the PMID in the input CSV",
+            )
+            log_event(
+                {
+                    "event": "failed",
+                    "pmid": raw_pmid,
+                    "error": failure.__dict__,
+                    "finished_at": now_timestamp(),
+                }
+            )
             write_result(
                 row,
                 status="failed",
                 source="validation",
-                error="invalid_pmid",
+                error=failure.code,
+                failure=failure,
             )
             continue
         if pmid in seen_pmids:
+            failure = FailureDetails(
+                category="validation",
+                code="duplicate_pmid",
+                detail=f"PMID {pmid} appears more than once in this input batch",
+                retryable=False,
+                recommended_action="remove or merge the duplicate CSV row",
+            )
+            log_event(
+                {
+                    "event": "skipped",
+                    "pmid": pmid,
+                    "error": failure.__dict__,
+                    "finished_at": now_timestamp(),
+                }
+            )
             write_result(
                 row,
                 status="skipped",
                 source="validation",
-                error="duplicate_pmid",
+                error=failure.code,
+                failure=failure,
             )
             continue
         seen_pmids.add(pmid)
@@ -1927,11 +2274,28 @@ def build_queue(
         if not doi:
             continue
         if not is_http_url(doi) and not doi.casefold().startswith("10."):
+            failure = FailureDetails(
+                category="validation",
+                code="invalid_doi",
+                detail=f"DOI is not a DOI value or HTTP(S) URL: {doi!r}",
+                retryable=False,
+                recommended_action="correct the DOI in the input CSV",
+            )
+            log_event(
+                {
+                    "event": "failed",
+                    "pmid": pmid,
+                    "doi": doi,
+                    "error": failure.__dict__,
+                    "finished_at": now_timestamp(),
+                }
+            )
             write_result(
                 row,
                 status="failed",
                 source="validation",
-                error="invalid_doi",
+                error=failure.code,
+                failure=failure,
             )
             continue
 
@@ -1942,7 +2306,7 @@ def build_queue(
     print(
         f"[URL PREP] selected={selected_count} eligible={len(eligible)} "
         f"start={BATCH_START} limit={BATCH_LIMIT} "
-        f"override_existing={OVERRIDE_EXISTING_DOWNLOAD_URLS}"
+        f"override_existing={OVERRIDE_EXISTING_DOWNLOAD_URLS} local_only=True"
     )
 
     queue: list[dict[str, str]] = []
@@ -1981,35 +2345,24 @@ def build_queue(
                 action = "repaired"
                 print(f"  [REPAIR URL] {existing_url} -> {url}")
             else:
-                refreshed_url = resolve_best_pdf_url(doi)
-                refresh_failed = (
-                    is_http_url(existing_url)
-                    and not is_doi_resolver_url(existing_url)
-                    and is_doi_resolver_url(refreshed_url)
+                refreshed_url = prepare_pdf_url_locally(doi)
+                url = refreshed_url
+                action = (
+                    "lazy_doi_resolution"
+                    if is_doi_resolver_url(url)
+                    else "refreshed_locally"
                 )
-                if refresh_failed:
-                    url = existing_url
-                    action = "kept_after_refresh_failure"
-                    print(
-                        "  [KEEP URL] DOI refresh returned only a fallback; "
-                        f"retaining {existing_url}"
-                    )
-                else:
-                    url = refreshed_url
-                    action = (
-                        "doi_fallback"
-                        if is_doi_resolver_url(url)
-                        else "refreshed"
-                    )
                 if existing_url and url != existing_url:
                     print(f"  [REFRESH URL] {existing_url} -> {url}")
         elif is_http_url(existing_url):
             url = existing_url
             action = "reused"
         else:
-            url = resolve_best_pdf_url(doi)
+            url = prepare_pdf_url_locally(doi)
             action = (
-                "doi_fallback" if is_doi_resolver_url(url) else "resolved"
+                "lazy_doi_resolution"
+                if is_doi_resolver_url(url)
+                else "prepared_locally"
             )
 
         action_counts[action] = action_counts.get(action, 0) + 1
@@ -2018,12 +2371,32 @@ def build_queue(
         if blocked_pattern:
             blocked_count += 1
             print(f"  [SKIP URL] pmid={pmid} pattern={blocked_pattern} url={url}")
+            failure = FailureDetails(
+                category="configured_skip",
+                code="blocked_url_pattern",
+                detail=f"URL matched configured blocked pattern {blocked_pattern!r}",
+                retryable=False,
+                recommended_action="review manually or revise BLOCKED_URL_PATTERNS",
+            )
+            log_event(
+                {
+                    "event": "skipped",
+                    "pmid": pmid,
+                    "publisher": publisher_name_for_url(url),
+                    "url": url,
+                    "matched_pattern": blocked_pattern,
+                    "error": failure.__dict__,
+                    "finished_at": now_timestamp(),
+                }
+            )
             write_result(
                 row,
                 status="skipped",
                 source="skip_rule",
                 error=f"blocked_url_pattern:{blocked_pattern}",
                 url=url,
+                publisher=publisher_name_for_url(url),
+                failure=failure,
             )
             continue
 
@@ -2060,6 +2433,17 @@ def main() -> int:
         return 1
     if SCIENCEDIRECT_REQUEST_ERROR_MAX_RETRIES < 0:
         print("SCIENCEDIRECT_REQUEST_ERROR_MAX_RETRIES must be >= 0")
+        return 1
+    if (
+        DOI_RESOLUTION_MIN_INTERVAL_SECONDS < 0
+        or DOI_RESOLUTION_JITTER_SECONDS < 0
+        or DOI_RESOLUTION_DEFAULT_RATE_LIMIT_PAUSE_SECONDS < 0
+        or DOI_RESOLUTION_MAX_RETRY_AFTER_SECONDS < 0
+    ):
+        print("DOI resolution pacing and cooldown values must be >= 0")
+        return 1
+    if any(threshold <= 0 for threshold in PUBLISHER_CIRCUIT_THRESHOLDS.values()):
+        print("All publisher circuit thresholds must be > 0")
         return 1
     if not INPUT_CSV.exists():
         print(f"Input CSV not found: {INPUT_CSV}")
@@ -2107,6 +2491,13 @@ def main() -> int:
     )
     print(f"[WATCH] {WATCH_DIR}")
     print(f"[OUT]   {OUTPUT_DIR}")
+    timeout_mode = "auto skip" if AUTO_SKIP_MODE else "interactive retry/skip"
+    print(
+        f"[TIMEOUT MODE] {timeout_mode}; wait={WAIT_TIMEOUT_SECONDS}s; "
+        f"exceptions={sorted(AUTO_SKIP_PUBLISHER_EXCEPTIONS) or 'none'}"
+    )
+    if BATCH_LOG_PATH is not None:
+        print(f"[EVENT LOG] {BATCH_LOG_PATH}")
     if AUTO_CLEAR_BROWSER_CACHE:
         cleanup_contents = (
             "cache and cookies" if CLEAR_COOKIES_WITH_CACHE else "cache only"
@@ -2126,19 +2517,15 @@ def main() -> int:
 
     successful_downloads = 0
     successful_cleanup_downloads_by_publisher: dict[str, int] = {}
+    consecutive_publisher_failures: dict[str, tuple[str, int]] = {}
+    open_publisher_circuits: dict[str, PublisherCircuit] = {}
 
     for position, row in enumerate(queue, start=1):
         pmid = normalize_pmid(row.get(PMID_COLUMN))
         url = normalize_cell(row.get(DOWNLOAD_URL_COLUMN))
-        strategy = download_strategy(url)
         destination = OUTPUT_DIR / f"{pmid}.pdf"
 
         print(f"\n[{position}/{len(queue)}] pmid={pmid}")
-        mode = "automatic" if strategy.automatic else "manual review"
-        print(f"  [MODE] {mode}: {strategy.label}")
-        print(f"  URL: {url}")
-        if not strategy.automatic:
-            print("  [ACTION] complete any login, access, or PDF clicks in the browser")
 
         if destination.exists() and is_pdf_file(destination):
             print(f"  [SKIP] already exists: {destination.name}")
@@ -2154,9 +2541,125 @@ def main() -> int:
                 write_csv_rows(OUTPUT_CSV, fieldnames, rows)
             continue
 
+        provisional_publisher = publisher_name_for_url(url)
+        if (
+            not DRY_RUN
+            and is_doi_resolver_url(url)
+            and provisional_publisher not in open_publisher_circuits
+        ):
+            print(f"  [LAZY RESOLVE] resolving DOI immediately before this record")
+            resolved_url = resolve_best_pdf_url(normalize_doi(row.get(DOI_COLUMN)))
+            if resolved_url:
+                url = resolved_url
+                row[DOWNLOAD_URL_COLUMN] = url
+                # Cache the result immediately so interrupted runs do not repeat
+                # successful DOI resolution work.
+                write_csv_rows(OUTPUT_CSV, fieldnames, rows)
+
+        blocked_pattern = matching_blocked_pattern(url)
+        if blocked_pattern:
+            finished_at = now_timestamp()
+            failure = FailureDetails(
+                category="configured_skip",
+                code="blocked_url_pattern",
+                detail=(
+                    f"lazily resolved URL matched configured blocked pattern "
+                    f"{blocked_pattern!r}"
+                ),
+                retryable=False,
+                recommended_action="review manually or revise BLOCKED_URL_PATTERNS",
+            )
+            publisher = publisher_name_for_url(url)
+            print(
+                f"  [SKIP URL] lazy result matched pattern={blocked_pattern} url={url}"
+            )
+            log_event(
+                {
+                    "event": "skipped",
+                    "pmid": pmid,
+                    "publisher": publisher,
+                    "url": url,
+                    "matched_pattern": blocked_pattern,
+                    "error": failure.__dict__,
+                    "finished_at": finished_at,
+                }
+            )
+            write_result(
+                row,
+                status="skipped",
+                source="skip_rule",
+                error=f"blocked_url_pattern:{blocked_pattern}",
+                finished_at=finished_at,
+                url=url,
+                publisher=publisher,
+                failure=failure,
+            )
+            write_csv_rows(OUTPUT_CSV, fieldnames, rows)
+            continue
+
+        strategy = download_strategy(url)
+        publisher = publisher_name_for_url(url)
+        row[FETCH_PUBLISHER_COLUMN] = publisher
+        mode = "automatic" if strategy.automatic else "manual review"
+        print(f"  [MODE] {mode}: {strategy.label}")
+        print(f"  URL: {url}")
+        if not strategy.automatic:
+            print("  [ACTION] complete any login, access, or PDF clicks in the browser")
+
+        circuit = open_publisher_circuits.get(publisher)
+        if circuit:
+            finished_at = now_timestamp()
+            failure = FailureDetails(
+                category="publisher_circuit_open",
+                code=circuit.signal,
+                detail=(
+                    f"publisher skipped after {circuit.failure_count} consecutive "
+                    f"{circuit.signal} failures (threshold {circuit.threshold})"
+                ),
+                retryable=True,
+                recommended_action="pause this publisher and retry later or review manually",
+            )
+            print(
+                f"  [PUBLISHER SKIP] {publisher}: circuit open after "
+                f"{circuit.failure_count} consecutive {circuit.signal} failures"
+            )
+            log_event(
+                {
+                    "event": "publisher_auto_skipped",
+                    "pmid": pmid,
+                    "publisher": publisher,
+                    "url": url,
+                    "error": failure.__dict__,
+                    "publisher_failure_count": circuit.failure_count,
+                    "circuit_opened_at": circuit.opened_at,
+                    "finished_at": finished_at,
+                }
+            )
+            write_result(
+                row,
+                status="skipped",
+                source="publisher_circuit_breaker",
+                error="publisher_circuit_open",
+                finished_at=finished_at,
+                url=url,
+                publisher=publisher,
+                failure=failure,
+                publisher_failure_count=circuit.failure_count,
+            )
+            write_csv_rows(OUTPUT_CSV, fieldnames, rows)
+            continue
+
         known = snapshot_completed_files(WATCH_DIR)
         started_at = now_timestamp()
-        log_event({"event": "open", "pmid": pmid, "url": url, "started_at": started_at})
+        log_event(
+            {
+                "event": "open",
+                "pmid": pmid,
+                "publisher": publisher,
+                "url": url,
+                "started_at": started_at,
+            }
+        )
 
         request_error_failure = ""
         download_unavailable = False
@@ -2165,10 +2668,12 @@ def main() -> int:
             while True:
                 open_status = open_url(url)
                 time.sleep(OPEN_DELAY_SECONDS)
-                if open_status is PublisherOpenStatus.DOWNLOAD_UNAVAILABLE:
+                if open_status.status is PublisherOpenStatus.DOWNLOAD_UNAVAILABLE:
                     download_unavailable = True
                     break
-                if open_status is not PublisherOpenStatus.REQUEST_BLOCKED:
+                if open_status.status is PublisherOpenStatus.HTTP_ERROR:
+                    break
+                if open_status.status is not PublisherOpenStatus.REQUEST_BLOCKED:
                     break
 
                 if (
@@ -2194,16 +2699,81 @@ def main() -> int:
         if DRY_RUN:
             continue
 
+        if open_status.status is PublisherOpenStatus.HTTP_ERROR:
+            finished_at = now_timestamp()
+            failure = failure_for_http_status(
+                open_status.http_status or 0,
+                open_status.detail,
+            )
+            circuit = record_publisher_failure(
+                publisher,
+                failure,
+                consecutive_publisher_failures,
+            )
+            failure_count = consecutive_publisher_failures.get(publisher, ("", 0))[1]
+            if circuit:
+                open_publisher_circuits[publisher] = circuit
+                print(
+                    f"  [CIRCUIT OPEN] {publisher} reached {failure_count} "
+                    f"consecutive {failure.code} failures; later records will be skipped"
+                )
+            log_event(
+                {
+                    "event": "failed",
+                    "pmid": pmid,
+                    "publisher": publisher,
+                    "url": url,
+                    "http_status": open_status.http_status,
+                    "error": failure.__dict__,
+                    "publisher_failure_count": failure_count,
+                    "circuit_opened": bool(circuit),
+                    "started_at": started_at,
+                    "finished_at": finished_at,
+                }
+            )
+            write_result(
+                row,
+                status="failed",
+                error=failure.code,
+                started_at=started_at,
+                finished_at=finished_at,
+                url=url,
+                publisher=publisher,
+                failure=failure,
+                publisher_failure_count=failure_count,
+            )
+            write_csv_rows(OUTPUT_CSV, fieldnames, rows)
+            continue
+
         if download_unavailable:
             finished_at = now_timestamp()
-            reason = "publisher_download_unavailable"
+            failure = (
+                failure_for_http_status(open_status.http_status, open_status.detail)
+                if open_status.http_status
+                else FailureDetails(
+                    category="access_unavailable",
+                    code="publisher_download_unavailable",
+                    detail=open_status.detail,
+                    retryable=False,
+                    recommended_action="review access for this article manually",
+                )
+            )
+            reason = failure.code
+            record_publisher_failure(
+                publisher,
+                failure,
+                consecutive_publisher_failures,
+            )
             print("  [SKIP] publisher does not permit this PDF download")
             log_event(
                 {
                     "event": "skipped",
                     "pmid": pmid,
+                    "publisher": publisher,
                     "url": url,
                     "reason": reason,
+                    "http_status": open_status.http_status,
+                    "error": failure.__dict__,
                     "started_at": started_at,
                     "finished_at": finished_at,
                 }
@@ -2215,6 +2785,8 @@ def main() -> int:
                 started_at=started_at,
                 finished_at=finished_at,
                 url=url,
+                publisher=publisher,
+                failure=failure,
             )
             write_csv_rows(OUTPUT_CSV, fieldnames, rows)
             click_rule = publisher_pdf_click_rule(url)
@@ -2227,6 +2799,28 @@ def main() -> int:
 
         if request_error_failure:
             finished_at = now_timestamp()
+            failure = FailureDetails(
+                category="rate_limited",
+                code="request_blocked",
+                detail=(
+                    f"{request_error_failure}; publisher block page remained after "
+                    f"{request_error_retries} recovery retries"
+                ),
+                retryable=True,
+                recommended_action="pause this publisher before retrying",
+            )
+            circuit = record_publisher_failure(
+                publisher,
+                failure,
+                consecutive_publisher_failures,
+            )
+            failure_count = consecutive_publisher_failures.get(publisher, ("", 0))[1]
+            if circuit:
+                open_publisher_circuits[publisher] = circuit
+                print(
+                    f"  [CIRCUIT OPEN] {publisher} reached {failure_count} "
+                    "consecutive request-blocked failures; later records will be skipped"
+                )
             print(
                 "  [FAILED] ScienceDirect request-error recovery stopped: "
                 f"{request_error_failure}",
@@ -2236,8 +2830,12 @@ def main() -> int:
                 {
                     "event": "failed",
                     "pmid": pmid,
+                    "publisher": publisher,
                     "url": url,
                     "reason": request_error_failure,
+                    "error": failure.__dict__,
+                    "publisher_failure_count": failure_count,
+                    "circuit_opened": bool(circuit),
                     "started_at": started_at,
                     "finished_at": finished_at,
                 }
@@ -2249,6 +2847,9 @@ def main() -> int:
                 started_at=started_at,
                 finished_at=finished_at,
                 url=url,
+                publisher=publisher,
+                failure=failure,
+                publisher_failure_count=failure_count,
             )
             write_csv_rows(OUTPUT_CSV, fieldnames, rows)
             continue
@@ -2261,13 +2862,23 @@ def main() -> int:
 
             if skipped:
                 finished_at = now_timestamp()
+                failure = FailureDetails(
+                    category="user_action",
+                    code="manually_skipped",
+                    detail="user skipped the record while waiting for a download",
+                    retryable=True,
+                    recommended_action="retry manually if the PDF is still needed",
+                )
                 print("  [SKIP] manually skipped")
+                reset_publisher_failures(publisher, consecutive_publisher_failures)
                 log_event(
                     {
                         "event": "skipped",
                         "pmid": pmid,
+                        "publisher": publisher,
                         "url": url,
                         "reason": "manually_skipped",
+                        "error": failure.__dict__,
                         "started_at": started_at,
                         "finished_at": finished_at,
                     }
@@ -2279,6 +2890,8 @@ def main() -> int:
                     started_at=started_at,
                     finished_at=finished_at,
                     url=url,
+                    publisher=publisher,
+                    failure=failure,
                 )
                 write_csv_rows(OUTPUT_CSV, fieldnames, rows)
                 break
@@ -2295,6 +2908,7 @@ def main() -> int:
                     {
                         "event": "success",
                         "pmid": pmid,
+                        "publisher": publisher,
                         "url": url,
                         "source_file": new_file.name,
                         "output_path": str(destination),
@@ -2310,8 +2924,10 @@ def main() -> int:
                     filename=destination.name,
                     url=url,
                     output_path=str(destination),
+                    publisher=publisher,
                 )
                 write_csv_rows(OUTPUT_CSV, fieldnames, rows)
+                reset_publisher_failures(publisher, consecutive_publisher_failures)
                 click_rule = publisher_pdf_click_rule(url)
                 uses_transient_download_tab = bool(
                     click_rule and click_rule.direct_navigation
@@ -2347,29 +2963,55 @@ def main() -> int:
                 break
 
             print("  [TIMEOUT] no download detected")
-            if INTERACTIVE_SKIP:
+            auto_skip = should_auto_skip_timeout(publisher)
+            if INTERACTIVE_SKIP and not auto_skip:
                 choice = input("  Retry (r) or skip (s)? ").strip().lower()
                 if choice == "r":
                     continue
 
             finished_at = now_timestamp()
+            failure = FailureDetails(
+                category="download_timeout",
+                code="download_not_detected",
+                detail=(
+                    f"no valid PDF appeared in {WATCH_DIR} within "
+                    f"{WAIT_TIMEOUT_SECONDS}s; strategy={strategy.label}; "
+                    f"automation_detail={open_status.detail or 'none'}"
+                ),
+                retryable=True,
+                recommended_action="review the page manually or retry this article later",
+            )
+            final_status = "skipped" if auto_skip else "failed"
+            event = "auto_skipped" if auto_skip else "failed"
+            reset_publisher_failures(publisher, consecutive_publisher_failures)
+            if auto_skip:
+                print(f"  [AUTO SKIP] no download after {WAIT_TIMEOUT_SECONDS}s")
             log_event(
                 {
-                    "event": "failed",
+                    "event": event,
                     "pmid": pmid,
+                    "publisher": publisher,
                     "url": url,
-                    "reason": "timeout",
+                    "reason": failure.code,
+                    "error": failure.__dict__,
+                    "wait_timeout_seconds": WAIT_TIMEOUT_SECONDS,
+                    "strategy": strategy.label,
+                    "automatic_strategy": strategy.automatic,
+                    "auto_skip_mode": AUTO_SKIP_MODE,
                     "started_at": started_at,
                     "finished_at": finished_at,
                 }
             )
             write_result(
                 row,
-                status="failed",
-                error="timeout",
+                status=final_status,
+                source="auto_skip" if auto_skip else "browser",
+                error=failure.code,
                 started_at=started_at,
                 finished_at=finished_at,
                 url=url,
+                publisher=publisher,
+                failure=failure,
             )
             write_csv_rows(OUTPUT_CSV, fieldnames, rows)
             break

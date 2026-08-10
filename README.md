@@ -66,6 +66,13 @@ year
 fetch_status
 fetch_source
 fetch_error
+fetch_error_category
+fetch_error_code
+fetch_error_detail
+fetch_error_retryable
+fetch_error_action
+fetch_publisher
+fetch_publisher_failure_count
 download_started_at
 download_finished_at
 download_filename
@@ -218,9 +225,9 @@ python download_browser_pdfs.py
 For each queued row, the script:
 
 1. Reuses a valid existing `browser/{pmid}.pdf`, if present.
-2. Chooses an institutional override, refreshes or reuses `download_url`
-   according to `OVERRIDE_EXISTING_DOWNLOAD_URLS`, then uses a known DOI route
-   or resolves the DOI through `doi.org`.
+2. Chooses an institutional override, refreshes or reuses `download_url`, and
+   applies known DOI routes locally. Unknown DOIs remain unresolved placeholders
+   until their individual record is about to run.
 3. Applies configured blocked/manual URL rules.
 4. Sorts verified automatic routes ahead of manual-review routes.
 5. Opens the URL and attempts a supported publisher click sequence when
@@ -243,8 +250,44 @@ that it belongs to the current article.
 While waiting on macOS or Linux, enter `s` and press `Enter` to skip the current
 record. On Windows, press `s`.
 
-The default wait is 600 seconds. After a timeout, an interactive run prompts you
+After the configured wait, an interactive run prompts you
 to retry with `r`; any other response records a timeout failure.
+
+### Auto-skip mode
+
+For an unattended batch, set this near the top of
+`download_browser_pdfs.py`:
+
+```python
+AUTO_SKIP_MODE = True
+```
+
+After `WAIT_TIMEOUT_SECONDS` passes without a valid PDF, the record is saved as
+`skipped` with source `auto_skip`, and the batch continues without prompting.
+To retain the retry/skip prompt for selected publishers, list their rule names
+(matching the names printed after `[MODE]`; comparison is case-insensitive):
+
+```python
+AUTO_SKIP_PUBLISHER_EXCEPTIONS = {"Wiley", "ScienceDirect"}
+```
+
+Every attempt is appended as structured JSON to `download_events.jsonl`.
+Failures are also split into stable CSV fields for category, code, detail,
+retryability, suggested action, publisher, and publisher failure count.
+
+The publisher circuit breaker skips later records from a publisher only after
+consecutive explicit signals: three HTTP 429 or request-blocked results, or four
+HTTP 403/502/503/504 results. A different signal restarts the count, and a
+successful download clears it. HTTP 401, HTTP 404, and ordinary download
+timeouts never disable a publisher because they commonly reflect login,
+article-specific, or ambiguous conditions. Circuit state lasts only for the
+current run; skipped records and the evidence that triggered the circuit remain
+in the CSV and JSONL log for later retry or manual review.
+
+HTTP status collection applies when the automated Chrome publisher route can
+read the top-level navigation response. Some browser pages and manual routes do
+not expose a status; those cases are recorded with their observed timeout or
+automation detail and do not count toward the publisher circuit.
 
 ## URL preparation and ordering
 
@@ -255,33 +298,39 @@ URL selection uses this order:
    existing URL using the row DOI; if no repair is needed, rebuild it from `doi`
 3. Otherwise, reuse an HTTP/HTTPS URL already stored in `download_url`
 4. A known DOI-prefix route
-5. A `HEAD` request to `doi.org`, followed by `GET` when needed and
-   publisher-specific URL rewriting
-6. The original `doi.org` URL if resolution fails
+5. An unresolved `doi.org` placeholder, resolved lazily immediately before that
+   individual record is opened
+6. The original `doi.org` URL if that lazy resolution fails
 
 URL preparation reports its own progress before browser downloads begin:
 
 ```text
-[URL PREP] selected=1431 eligible=1431 start=0 limit=2000 override_existing=True
+[URL PREP] selected=1431 eligible=1431 start=0 limit=2000 override_existing=True local_only=True
 [URL 1/1431] pmid 42415230 | refresh existing URL
 ...
 [URL PREP DONE] queued=1431 blocked=0 | refreshed=1200 reused=200 ...
 ```
 
-The URL messages mean:
+`URL PREP` performs no network requests. Once an unresolved record reaches the
+front of the queue, `[LAZY RESOLVE]` appears and only that DOI is looked up. A
+successful result is written to the CSV immediately so an interrupted run does
+not repeat it.
+
+The lazy-resolution messages mean:
 
 - `RESOLVE HEAD` or `RESOLVE GET`: the DOI resolver successfully redirected to
-  a publisher. `GET` is tried when the lighter `HEAD` request fails.
+  a publisher. `GET` is used only when a server explicitly rejects `HEAD` with
+  HTTP 405 or 501; it is not attempted after 403, 404, 429, or network errors.
 - `REWRITE`: a resolved article page was converted to the publisher's preferred
   PDF or full-article route. This is not an error.
 - `REPAIR URL`: an existing publisher URL was corrected locally using its DOI,
   without another resolver request.
 - `REFRESH URL`: with `OVERRIDE_EXISTING_DOWNLOAD_URLS = True`, a newly prepared
   URL replaced the saved value.
-- `KEEP URL`: refresh failed and returned only a generic DOI fallback, so the
-  existing publisher URL was preserved.
-- `RESOLVE FALLBACK`: both lookup methods failed. If no better existing URL is
-  available, the browser receives the `doi.org` URL and follows it interactively.
+- `RESOLVE RATE LIMIT` / `RESOLVE PAUSED`: an HTTP 429 response paused further
+  lookup traffic. `Retry-After` is honored up to the configured safety cap.
+- `RESOLVE FALLBACK`: lookup failed. If no better existing URL is available,
+  the browser receives the `doi.org` URL after any active cooldown.
 
 Common resolver failures are `HTTP 403` (the publisher refused an automated
 lookup), `HTTP 302` (a redirect loop or rejected redirect), and timeout/network
@@ -401,7 +450,7 @@ Configuration is currently done by editing constants near the top of
 | `OUTPUT_CSV` | `INPUT_CSV` | CSV replaced with updated rows. Set a different path to preserve the input file. |
 | `WATCH_DIR` | `Path.home() / "Downloads"` | Directory polled for newly completed browser downloads. |
 | `OUTPUT_DIR` | `PROJECT_ROOT / "browser"` | Destination for PDFs renamed as `{pmid}.pdf`. |
-| `BATCH_LOG_PATH` | `None` | Optional JSON Lines event log. Set to a `Path`; `None` disables event logging. |
+| `BATCH_LOG_PATH` | `PROJECT_ROOT / "download_events.jsonl"` | Append-only structured JSON Lines event log. Set to `None` to disable it. |
 
 All four path constants are resolved to absolute paths by the script.
 
@@ -424,7 +473,7 @@ uses a different schema.
 | `DOWNLOAD_FILENAME_COLUMN` | `"download_filename"` | Final basename, normally `{pmid}.pdf`. |
 | `DOWNLOAD_URL_COLUMN` | `"download_url"` | Prepared URL used for the attempt. Existing values are refreshed or reused according to `OVERRIDE_EXISTING_DOWNLOAD_URLS`. |
 | `OUTPUT_PATH_COLUMN` | `"output_path"` | Absolute path of a successfully stored PDF. |
-| `DOWNLOAD_RESULT_FIELDS` | The eight result columns above | Internal ordered list of result columns added when missing. |
+| `DOWNLOAD_RESULT_FIELDS` | The result columns above | Internal ordered list of result columns added when missing. |
 
 ### Batch and download controls
 
@@ -432,12 +481,18 @@ uses a different schema.
 | --- | --- | --- |
 | `BATCH_START` | `0` | Zero-based offset into eligible records. Must be `>= 0`. |
 | `BATCH_LIMIT` | `2000` | Maximum eligible records selected. Must be `> 0`. |
-| `OVERRIDE_EXISTING_DOWNLOAD_URLS` | `False` | `True` rebuilds each queued row's URL from `doi` and stores it in `download_url`; `False` reuses an existing HTTP/HTTPS `download_url` and only resolves rows without one. Institutional overrides always take precedence. |
+| `OVERRIDE_EXISTING_DOWNLOAD_URLS` | `False` | `True` rebuilds each queued row's URL locally from `doi`; `False` reuses an existing HTTP/HTTPS `download_url`. Unknown DOI placeholders are resolved lazily per record. Institutional overrides always take precedence. |
+| `DOI_RESOLUTION_MIN_INTERVAL_SECONDS` | `1.5` | Minimum delay between lazy DOI resolver requests. |
+| `DOI_RESOLUTION_JITTER_SECONDS` | `0.75` | Random additional delay added to resolver pacing. |
+| `DOI_RESOLUTION_DEFAULT_RATE_LIMIT_PAUSE_SECONDS` | `60` | Cooldown used for HTTP 429 without a valid `Retry-After`. |
+| `DOI_RESOLUTION_MAX_RETRY_AFTER_SECONDS` | `300` | Safety cap for a server-provided `Retry-After` pause. |
 | `OPEN_DELAY_SECONDS` | `1.5` | Pause after initiating a URL open. Non-negative seconds are expected. |
-| `WAIT_TIMEOUT_SECONDS` | `600` | Maximum seconds to wait for a PDF before prompting/failing. Must be `> 0`. |
+| `WAIT_TIMEOUT_SECONDS` | `10` | Maximum seconds to wait for a PDF before prompting/failing or auto-skipping. Must be `> 0`. |
 | `POLL_INTERVAL_SECONDS` | `1` | Delay between scans of `WATCH_DIR`. Must be `> 0`. |
 | `MIN_FILE_SIZE_BYTES` | `1024` | Minimum accepted PDF size in bytes. |
 | `INTERACTIVE_SKIP` | `True` | `True` enables keyboard skipping and the retry prompt; `False` turns a timeout directly into failure. |
+| `AUTO_SKIP_MODE` | `False` | When enabled, records without a detected PDF are skipped after the timeout without prompting. |
+| `AUTO_SKIP_PUBLISHER_EXCEPTIONS` | `set()` | Publisher rule names that retain interactive timeout handling in auto-skip mode. |
 | `DRY_RUN` | `False` | `True` prepares/displays the queue without opening URLs, moving PDFs, or writing CSV changes. |
 | `OPEN_COMMAND` | `None` | Optional command string used instead of Chrome automation/default-browser opening, such as `"open -a Safari"`. `None` uses normal behavior. |
 | `BLOCKED_URL_PATTERNS` | `["karger.com", "ashpublications.org", "ascopubs.org", "neurology.org", "auajournals.org", "10.1158"]` | Case-insensitive URL substrings that cause a row to be recorded as skipped. Use `[]` to disable. |
@@ -487,7 +542,7 @@ preserved among rows with the same priority.
 | `INSTITUTIONAL_URL_OVERRIDES` | Three DOI-to-institutional URL mappings | Exact DOI-to-URL mappings for opaque institutional viewer URLs. Use `{}` when no overrides are needed. |
 | `TEMP_SUFFIXES` | `{".crdownload", ".part", ".download", ".tmp"}` | Files and companion files treated as incomplete downloads. |
 | `DOI_PREFIX_RULES` | Rules for `10.3390`, `10.1007`, `10.1038`, `10.1002`, `10.1111`, `10.1096`, `10.1021`, `10.3389`, `10.1073`, `10.1126`, `10.1128`, `10.1089`, `10.1080`, and `10.1088` | Ordered DOI-prefix-to-publisher URL templates checked before resolving through `doi.org`. |
-| `DOI_REDIRECT_HOST_HINTS` | Hints for `10.1001`, exact legacy JID `10.1086/340133`, `10.1093`, `10.1097`, `10.1136`, `10.1158`, legacy JITC `10.1186/s40425-*`, `10.1200`, `10.1210`, `10.1182`, `10.1212`, `10.1371`, `10.1634`, `10.18632`, `10.21873`, `10.2217`, `10.3109`, `10.3324`, `10.4143`, `10.7205`, and `10.7326` | Maps unresolved DOI prefixes to likely publisher hosts for click-rule selection, blocked-rule matching, and safe automatic tab closing. |
+| `DOI_REDIRECT_HOST_HINTS` | Hints for common unresolved DOI families, including `10.1016`, `10.1039`, `10.1177`, and the publisher families listed in the source | Maps unresolved DOI prefixes to likely publisher hosts for click-rule selection, blocked-rule matching, circuit checks, and safe automatic tab closing. |
 
 ### Publisher endpoint variables
 
@@ -561,8 +616,8 @@ Set `BATCH_LOG_PATH` to a `Path` to append JSON Lines event records. Set
 the Chrome publisher-click automation.
 
 Set `DRY_RUN = True` to prepare and display the queue without opening URLs,
-moving downloads, or writing CSV results. The script can still resolve DOI URLs
-over the network and create the configured watch/output directories.
+moving downloads, writing CSV results, or resolving DOI URLs over the network.
+It can still create the configured watch/output directories.
 
 ## Scheduled breaks and Chrome cleanup
 
