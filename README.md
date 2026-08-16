@@ -74,6 +74,7 @@ title
 abstract
 journal
 year
+skip_future_runs
 fetch_status
 fetch_source
 fetch_error
@@ -90,6 +91,7 @@ download_filename
 download_url
 output_path
 is_fetch_target
+skip_future_runs
 ```
 
 ---
@@ -236,20 +238,27 @@ python download_browser_pdfs.py
 For each queued row, the script:
 
 1. Reuses a valid existing `browser/{pmid}.pdf`, if present.
-2. Chooses an institutional override, refreshes or reuses `download_url`, and
-   applies known DOI routes locally. Unknown DOIs remain unresolved placeholders
-   until their individual record is about to run.
-3. Applies configured blocked/manual URL rules.
-4. Sorts verified automatic routes ahead of manual-review routes.
-5. Opens the URL and attempts a supported publisher click sequence when
+2. Skips rows marked `skip_future_runs=Y` and rows with a previously recorded
+   non-retryable terminal not-found result.
+3. Chooses an institutional override, repairs or reuses `download_url`, applies
+   known DOI routes locally, and can route otherwise uncustomized article pages
+   through the OSU proxy when appropriate. Unknown DOIs remain unresolved
+   placeholders until their individual record is about to run.
+4. Applies configured blocked/manual URL rules.
+5. Sorts records by publisher/download strategy while preserving CSV order
+   within the same priority.
+6. Opens the URL and attempts a supported publisher click sequence when
    applicable.
-6. Watches `~/Downloads` for a new or changed file. For ScienceDirect URLs,
-   it also checks that the downloaded filename contains the expected article
-   PII and ignores unrelated PDF downloads.
-7. Accepts only a file of at least 1,024 bytes containing a PDF signature in
+7. Watches `~/Downloads` for a completed PDF. If Chrome creates a temporary
+   download such as `.crdownload`, the script detects active progress and keeps
+   waiting beyond the initial discovery timeout until the file completes, stalls,
+   or reaches the in-progress download limit. For ScienceDirect URLs, it also
+   checks that the downloaded filename contains the expected article PII and
+   ignores unrelated PDF downloads.
+8. Accepts only a file of at least 1,024 bytes containing a PDF signature in
    its first 1,024 bytes.
-8. Moves the file to `browser/{pmid}.pdf`.
-9. Updates `target_records.csv` after each final result.
+9. Moves the file to `browser/{pmid}.pdf`.
+10. Updates `target_records.csv` after each final result.
 
 Avoid downloading unrelated PDFs while the script is waiting. ScienceDirect
 downloads are checked against the expected PII in the filename, but other
@@ -258,11 +267,26 @@ that it belongs to the current article.
 
 ### Skip or retry
 
-While waiting on macOS or Linux, enter `s` and press `Enter` to skip the current
-record. On Windows, press `s`.
+While waiting on macOS or Linux:
 
-After the configured wait, an interactive run prompts you
-to retry with `r`; any other response records a timeout failure.
+- Enter `s` and press `Enter` to skip the current record for this run.
+- Enter `p` and press `Enter` to mark the record as a persistent skip.
+
+On Windows, press `s` or `p` respectively.
+
+A persistent skip writes:
+
+```text
+skip_future_runs: Y
+fetch_status: skipped
+fetch_error: manually_skipped_future
+```
+
+Rows with `skip_future_runs=Y` are not queued on later runs. Clear the value or
+set it to `N` to allow the row to be attempted again.
+
+After the configured wait, an interactive run can prompt for retry when
+auto-skip behavior does not apply.
 
 ### Auto-skip mode
 
@@ -289,11 +313,17 @@ retryability, suggested action, publisher, and publisher failure count.
 The publisher circuit breaker skips later records from a publisher only after
 consecutive explicit signals: three HTTP 429 or request-blocked results, or four
 HTTP 403/502/503/504 results. A different signal restarts the count, and a
-successful download clears it. HTTP 401, HTTP 404, and ordinary download
-timeouts never disable a publisher because they commonly reflect login,
-article-specific, or ambiguous conditions. Circuit state lasts only for the
-current run; skipped records and the evidence that triggered the circuit remain
-in the CSV and JSONL log for later retry or manual review.
+successful download clears it. Ordinary download timeouts do not disable a
+publisher.
+
+Publisher pages that clearly report that an article or DOI does not exist are
+recorded as terminal, non-retryable results such as `article_not_found`,
+`doi_not_found`, or `http_404`. Those rows are skipped on later runs unless the
+record is corrected.
+
+Rate-limited publishers can be paused and retried without stopping the entire
+batch. Optica Publishing Group uses a publisher-specific cooldown/requeue
+workflow so other publishers can continue while Optica is cooling down.
 
 HTTP status collection applies when the automated Chrome publisher route can
 read the top-level navigation response. Some browser pages and manual routes do
@@ -305,18 +335,19 @@ automation detail and do not count toward the publisher circuit.
 URL selection uses this order:
 
 1. `INSTITUTIONAL_URL_OVERRIDES`
-2. If `OVERRIDE_EXISTING_DOWNLOAD_URLS` is `True`, first try to repair the
-   existing URL using the row DOI; if no repair is needed, rebuild it from `doi`
-3. Otherwise, repair a saved RSC DOI-resolver URL into its deterministic
-   institutional article route when its article code is recognized
-4. Repair other recognized saved publisher URLs locally (for example, IOP
-   public URLs are changed to the OSU proxy host)
-5. Reuse any remaining HTTP/HTTPS URL already stored in `download_url`
-6. A known DOI-prefix route; `10.1039` RSC article DOIs use a deterministic
-   institutional article-landing route and `10.1088` IOP DOIs use the OSU proxy
-7. An unresolved `doi.org` placeholder, resolved lazily immediately before that
-   individual record is opened
-8. The original `doi.org` URL if that lazy resolution fails
+2. If `OVERRIDE_EXISTING_DOWNLOAD_URLS` is `True`, repair a recognized saved
+   URL when possible; otherwise rebuild the route locally from `doi`
+3. Repair recognized DOI-resolver URLs with deterministic publisher routes when
+   available, including AIP and RSC
+4. Repair recognized saved publisher URLs locally
+5. Apply a generic OSU EZproxy hostname for otherwise uncustomized article-page
+   URLs when `TRY_OSU_PROXY_FOR_UNCUSTOMIZED_URLS=True` and the route is safe to
+   proxy
+6. Reuse any remaining HTTP/HTTPS URL already stored in `download_url`
+7. Use a known DOI-prefix route when available
+8. Keep an unresolved `doi.org` placeholder for lazy resolution immediately
+   before that record is opened
+9. Use the original `doi.org` URL if lazy resolution fails
 
 URL preparation reports its own progress before browser downloads begin:
 
@@ -336,64 +367,39 @@ The lazy-resolution messages mean:
 
 - `RESOLVE HEAD` or `RESOLVE GET`: the DOI resolver successfully redirected to
   a publisher. `GET` is used only when a server explicitly rejects `HEAD` with
-  HTTP 405 or 501; it is not attempted after 403, 404, 429, or network errors.
-- `REWRITE`: a resolved article page was converted to the publisher's preferred
-  PDF or full-article route. This is not an error.
-- `REPAIR URL`: an existing publisher URL was corrected locally using its DOI,
-  without another resolver request.
+  HTTP 405 or 501.
+- `REWRITE`: a resolved article page was converted to the preferred publisher,
+  institutional, reader, or PDF route.
+- `REPAIR URL`: an existing URL was corrected locally using the DOI.
 - `REFRESH URL`: with `OVERRIDE_EXISTING_DOWNLOAD_URLS = True`, a newly prepared
   URL replaced the saved value.
 - `RESOLVE RATE LIMIT` / `RESOLVE PAUSED`: an HTTP 429 response paused further
   lookup traffic. `Retry-After` is honored up to the configured safety cap.
-- `RESOLVE FALLBACK`: lookup failed. If no better existing URL is available,
-  the browser receives the `doi.org` URL after any active cooldown.
+- `RESOLVE FALLBACK`: lookup failed and the browser receives the unresolved DOI
+  URL after any active cooldown.
 
-Common resolver failures are `HTTP 403` (the publisher refused an automated
-lookup), `HTTP 302` (a redirect loop or rejected redirect), and timeout/network
-errors. They do not necessarily mean the article is unavailable. The rewrite layer also
-repairs common cookie/error routes such as Literatum `cookieAbsent`,
-`crawlprevention/governor`, and `cookies_not_supported`, and preserves Wiley
-journal subdomains when constructing OSU proxy URLs. To avoid
-repeating resolver requests after URLs have been prepared, set:
+Common resolver failures include HTTP 403, rejected redirects, timeout, and
+network errors. They do not necessarily mean the article is unavailable. The
+rewrite layer repairs common cookie/error routes and supports publisher-specific
+public-to-OSU-proxy handoffs.
+
+To avoid rebuilding saved URLs on each run, keep:
 
 ```python
 OVERRIDE_EXISTING_DOWNLOAD_URLS = False
 ```
 
-The default blocked rules are:
+The current blocked rules are defined in `BLOCKED_URL_PATTERNS` near the top of
+`download_browser_pdfs.py`. Matching is a case-insensitive substring search.
+For unresolved `doi.org` URLs, configured DOI-prefix host hints are also checked,
+so known blocked publishers can be skipped before Chrome opens the redirect.
 
-```python
-BLOCKED_URL_PATTERNS = [
-    "onlinelibrary-wiley-com",
-    "pubs-acs-org",
-    "10.1177",
-    "link.springer.com",
-    "karger.com",
-    "10.1159",
-    "ashpublications.org",
-    "ascopubs.org",
-    "neurology.org",
-    "auajournals.org",
-    "10.1158",
-    "ovid.com",
-    "jamaoto",
-    "jamaoncol",
-    "eurekaselect.com",
-    "ersnet.org",
-    "10.23736",
-    "degruyterbrill.com",
-    "dustri.com",
-]
-```
-
-Matching is a case-insensitive substring search. For unresolved `doi.org`
-URLs, configured DOI-prefix host hints are also checked, so known blocked
-publishers can be skipped before Chrome opens the redirect. A matching row is not opened and is recorded as:
+A matching row is recorded as:
 
 ```text
 fetch_status: skipped
 fetch_source: skip_rule
-fetch_error: blocked_url_pattern:karger.com
+fetch_error: blocked_url_pattern:<pattern>
 ```
 
 There are no active manual-review patterns by default:
@@ -403,47 +409,55 @@ MANUAL_URL_PATTERNS = []
 ```
 
 A manual-rule match remains queued but is processed after automatic routes.
-Blocked patterns take precedence over publisher automation, so the default
-Wiley, ACS, SAGE (`10.1177`), and Springer patterns are skipped even though the
-script contains automatic click rules for those publishers. Remove a pattern
-only when you intend to enable that route.
+Blocked patterns take precedence over publisher automation.
 
 Known automatic click rules currently cover:
 
+- Springer Nature
+- AIP Publishing
+- The Company of Biologists
+- JoVE
+- Optica Publishing Group
+- ALTEX
 - ScienceDirect
 - ACS
+- AMA Journal of Ethics
 - ASCO Publications
+- NEJM
+- Science Partner Journals
+- bioRxiv
+- BioImpacts
+- IEEE Xplore
 - Wiley
 - SAGE
+- PNAS
+- ASM Journals
 - RSC
-- AMA Journal of Ethics
 - Taylor & Francis
 - Oxford Academic
 - IOPscience
 - IIAR Journals
+- JCI Insight
+- PLOS
+- Oncotarget
+- ACP Journals
 - AACR Journals
 - JAMA Network
-- NEJM
 - Ovid
 - AUA Journals
 - Nature
 - Haematologica
 - Cancer Research and Treatment
 - BMJ
-- JCI Insight
-- PLOS
-- Oncotarget
-- ACP Journals
 
 Recognizable direct-PDF URLs are also placed in the automatic tier. EBSCO
 institutional viewer URLs and unknown publisher layouts remain in the
 manual-review tier. Stable CSV ordering is preserved within the same priority.
 
-The current RSC and IOP rules can hand a public publisher URL off to its OSU
-proxy equivalent before clicking the PDF control. RSC receives a 90-second
-publisher-click allowance for older or nonstandard DOI routes. ACS recognizes
-both legacy `/doi/pdf/` controls and current Silverchair `/article-pdf/`
-controls; Oxford Academic also recognizes `/advance-article-pdf/` links.
+Several publisher rules can hand a public URL to its OSU proxy equivalent before
+clicking the PDF control. Publisher-specific selectors support direct PDF links,
+reader/ePDF pages, download menus, access notices, and selected request-limit
+pages.
 
 ## Output
 
@@ -456,6 +470,7 @@ browser/{pmid}.pdf
 The script adds missing result columns to `target_records.csv`:
 
 ```text
+skip_future_runs
 fetch_status
 fetch_source
 fetch_error
@@ -477,10 +492,10 @@ Possible statuses are:
 
 - `pending`: queued, but no final result has been written yet
 - `success`: a new or existing valid PDF is available
-- `skipped`: a duplicate, blocked/circuit-open route, manual skip, unavailable
-  publisher download, or auto-skipped timeout
-- `failed`: validation failure, non-auto-skipped timeout, HTTP error, or
-  ScienceDirect recovery failure
+- `skipped`: a duplicate, blocked/circuit-open route, one-run or persistent
+  manual skip, unavailable publisher download, or auto-skipped timeout
+- `failed`: validation failure, terminal article/DOI not-found result,
+  non-auto-skipped timeout, HTTP error, or exhausted publisher recovery
 
 CSV updates are written through a temporary file and atomically replace the
 original CSV.
@@ -513,6 +528,7 @@ uses a different schema.
 | `PMID_COLUMN` | `"pmid"` | Column containing the PubMed ID and source of the output filename. |
 | `DOI_COLUMN` | `"doi"` | Column containing a DOI, DOI URL, or article URL. |
 | `IS_FETCH_TARGET_COLUMN` | `"is_fetch_target"` | Optional row-selection column. |
+| `SKIP_FUTURE_RUNS_COLUMN` | `"skip_future_runs"` | Persistent row-skip column. Rows marked `Y` are excluded from later queues until cleared. |
 | `TARGET_ENABLED_VALUE` | `"Y"` | Selection marker, matched case-insensitively after trimming whitespace. |
 | `FETCH_STATUS_COLUMN` | `"fetch_status"` | Final or pending state of the row. |
 | `FETCH_SOURCE_COLUMN` | `"fetch_source"` | Component that produced the result. |
@@ -543,8 +559,11 @@ uses a different schema.
 | `DOI_RESOLUTION_DEFAULT_RATE_LIMIT_PAUSE_SECONDS` | `60` | Cooldown used for HTTP 429 without a valid `Retry-After`. |
 | `DOI_RESOLUTION_MAX_RETRY_AFTER_SECONDS` | `300` | Safety cap for a server-provided `Retry-After` pause. |
 | `OPEN_DELAY_SECONDS` | `5` | Pause after initiating a URL open. Non-negative seconds are expected. |
-| `WAIT_TIMEOUT_SECONDS` | `15` | Maximum seconds to wait for a PDF before prompting/failing or auto-skipping. Must be `> 0`. |
+| `WAIT_TIMEOUT_SECONDS` | `15` | Initial discovery window for a completed PDF or an active temporary download. Must be `> 0`. |
 | `POLL_INTERVAL_SECONDS` | `2` | Delay between scans of `WATCH_DIR`. Must be `> 0`. |
+| `IN_PROGRESS_DOWNLOAD_TIMEOUT_SECONDS` | `900` | Maximum total wait for a detected temporary/in-progress download to finish. |
+| `IN_PROGRESS_DOWNLOAD_STALL_SECONDS` | `120` | Stops waiting when an in-progress download has not changed for this many seconds. |
+| `DOWNLOAD_PROGRESS_REPORT_SECONDS` | `15` | Interval for terminal progress messages while an incomplete download is active. |
 | `MIN_FILE_SIZE_BYTES` | `1024` | Minimum accepted PDF size in bytes. |
 | `INTERACTIVE_SKIP` | `True` | `True` enables keyboard skipping and the retry prompt; `False` turns a timeout directly into failure. |
 | `AUTO_SKIP_MODE` | `True` | When enabled, records without a detected PDF are skipped after the timeout without prompting. |
@@ -554,6 +573,7 @@ uses a different schema.
 | `BLOCKED_URL_PATTERNS` | See the complete default list under URL preparation above | Case-insensitive URL substrings that cause a row to be recorded as skipped. Use `[]` to disable. |
 | `MANUAL_URL_PATTERNS` | `[]` | Case-insensitive URL substrings forced into the manual-review tier. Use `[]` to disable. |
 | `AUTOMATE_PUBLISHER_PDF_CLICK` | `True` | Enables supported Chrome/AppleScript publisher clicks. |
+| `TRY_OSU_PROXY_FOR_UNCUSTOMIZED_URLS` | `True` | Routes otherwise uncustomized article-page URLs through the OSU EZproxy hostname when appropriate. |
 | `PUBLISHER_CLICK_TIMEOUT_SECONDS` | `20` | Maximum publisher automation window in seconds. |
 | `CLOSE_COMPLETED_AUTOMATIC_TABS` | `True` | Closes the active automated tab after its PDF is detected, if the tab still matches the expected host. |
 
@@ -567,7 +587,10 @@ uses a different schema.
 | `CLEAR_COOKIES_WITH_CACHE` | `True` | `True` also closes Chrome and deletes the configured profile's complete cookie databases; `False` preserves cookies. |
 | `DOWNLOAD_BREAK_EVERY_FILES` | `100` | Successful-download interval for the scheduled break. Must be `> 0`. |
 | `DOWNLOAD_BREAK_SECONDS` | `30` | Break duration and ScienceDirect recovery delay. Must be `>= 0`. |
-| `SCIENCEDIRECT_REQUEST_ERROR_MAX_RETRIES` | `3` | Maximum cleanup/retry cycles for one detected ScienceDirect request error. Must be `>= 0`; `0` disables recovery retries. |
+| `SCIENCEDIRECT_REQUEST_ERROR_MAX_RETRIES` | `3` | Maximum request-error recovery retries for a publisher attempt; ScienceDirect uses cache/cookie cleanup while other supported publishers use a lighter retry path. |
+| `OPTICA_DOWNLOADS_PER_BURST` | `5` | Successful Optica downloads allowed before a scheduled publisher cooldown. |
+| `OPTICA_COOLDOWN_SECONDS` | `300` | Optica cooldown duration used after a burst or detected publisher request limit. |
+| `OPTICA_RATE_LIMIT_MAX_DEFERRALS` | `3` | Maximum times one Optica row can be requeued after a detected request-limit page. |
 | `CLOSE_SCIENCEDIRECT_TABS_AT_BREAK` | `True` | Closes ScienceDirect tabs whenever the download-break interval is reached. |
 | `CHROME_PROFILE_DIRECTORY` | `"Default"` | Final directory name of the Chrome profile targeted by cleanup, for example `"Profile 1"`. |
 
@@ -592,38 +615,27 @@ preserved among rows with the same priority.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `AUTO_PUBLISHER_PRIORITY` | ScienceDirect `0`; Springer Nature `1`; ASCO Publications `15`; Oxford Academic `20`; RSC `40`; AMA Journal of Ethics `45`; IOPscience `70`; IIAR Journals `80`; AACR Journals `90`; JAMA Network `100`; NEJM `105`; Ovid `110`; AUA Journals `115`; Nature `120`; Haematologica `125`; SAGE `130`; Cancer Research and Treatment `130`; BMJ `135`; JCI Insight `140`; PLOS `145`; Oncotarget `147`; Wiley `148`; ACS `148`; Taylor & Francis `148`; ACP Journals `149` | Processing order for verified publisher click rules. |
+| `AUTO_PUBLISHER_PRIORITY` | Publisher-specific numeric priorities defined in the script; lower values run first | Processing order for verified publisher click rules. ScienceDirect currently runs after most publisher-specific automatic routes. |
 | `DIRECT_PDF_PRIORITY` | `200` | Priority for recognizable direct-PDF URLs. |
 | `MANUAL_REVIEW_PRIORITY` | `1000` | Priority for configured manual patterns, EBSCO viewers, and unknown layouts. |
 | `INSTITUTIONAL_URL_OVERRIDES` | Three DOI-to-institutional URL mappings | Exact DOI-to-URL mappings for opaque institutional viewer URLs. Use `{}` when no overrides are needed. |
 | `TEMP_SUFFIXES` | `{".crdownload", ".part", ".download", ".tmp"}` | Files and companion files treated as incomplete downloads. |
-| `DOI_PREFIX_RULES` | Rules for `10.3390`, `10.1007`, `10.1038`, `10.1002`, `10.1111`, `10.1096`, `10.1021`, `10.3389`, `10.1073`, `10.1126`, `10.1128`, `10.1089`, `10.1080`, and `10.1088` | Ordered DOI-prefix-to-publisher URL templates checked before resolving through `doi.org`. |
-| `DOI_REDIRECT_HOST_HINTS` | Hints for common unresolved DOI families, including `10.1016`, `10.1039`, `10.1001/amajethics.`, `10.1177`, and the publisher families listed in the source | Maps unresolved DOI prefixes to likely publisher hosts for click-rule selection, blocked-rule matching, circuit checks, and safe automatic tab closing. |
+| `DOI_PREFIX_RULES` | Publisher routes defined in the script, including AIP, Company of Biologists, MDPI, Springer/Nature, Wiley/Physiological Society, ACS, Frontiers, PNAS, Science, ASM, Liebert/SAGE, Taylor & Francis, and IOP | Ordered DOI-prefix-to-publisher URL templates checked before resolving through `doi.org`. |
+| `DOI_REDIRECT_HOST_HINTS` | Host hints for supported and recognized DOI families | Maps unresolved DOI prefixes to likely publisher hosts for click-rule selection, blocked-rule matching, circuit checks, proxy routing, and safe automatic tab closing. |
 
 ### Publisher endpoint variables
 
-These are internal URL-building defaults, not ordinary runtime switches.
+These are internal URL-building defaults, not ordinary runtime switches. They
+define public and OSU-proxied routes used by publisher-specific automation.
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `SCIENCEDIRECT_PROXY_HOST` | `www-sciencedirect-com.proxy.lib.ohio-state.edu` | OSU ScienceDirect proxy host recognized by routing and click rules. |
-| `SCIENCEDIRECT_ARTICLE_BASE_URL` | ScienceDirect proxy `/science/article/pii` URL | Base URL used when rewriting Elsevier PII links. |
-| `ACS_PROXY_HOST` | `pubs-acs-org.proxy.lib.ohio-state.edu` | OSU ACS proxy host. |
-| `ACS_ARTICLE_BASE_URL` | ACS proxy `/doi/full` URL | Base URL used for ACS DOI routes. |
-| `WILEY_PROXY_HOST` | `onlinelibrary-wiley-com.proxy.lib.ohio-state.edu` | OSU Wiley proxy host. |
-| `WILEY_ARTICLE_BASE_URL` | Wiley proxy `/doi/full` URL | Fallback base URL for Wiley DOI routes; journal-specific Wiley subdomains are preserved when possible. |
-| `SAGE_PROXY_HOST` | `journals-sagepub-com.proxy.lib.ohio-state.edu` | OSU SAGE proxy host. |
-| `SAGE_ARTICLE_BASE_URL` | SAGE proxy `/doi/full` URL | Base URL used for SAGE DOI routes. |
-| `LIEBERT_ARTICLE_BASE_URL` | `https://www.liebertpub.com/doi/pdf` | Public Liebert PDF base URL. |
-| `TANDF_PROXY_HOST` | `www-tandfonline-com.proxy.lib.ohio-state.edu` | OSU Taylor & Francis proxy host. |
-| `TANDF_ARTICLE_BASE_URL` | Taylor & Francis proxy `/doi/full` URL | Base URL used for Taylor & Francis DOI routes. |
-| `RSC_PUBLIC_HOST` | `pubs.rsc.org` | Public RSC host recognized by routing and proxy handoff. |
-| `RSC_PROXY_HOST` | `pubs-rsc-org.proxy.lib.ohio-state.edu` | OSU RSC proxy host. |
-| `IOP_PUBLIC_HOST` | `iopscience.iop.org` | Public IOPscience host recognized by routing and proxy handoff. |
-| `IOP_PROXY_HOST` | `iopscience-iop-org.proxy.lib.ohio-state.edu` | OSU IOPscience proxy host. |
-| `IOP_ARTICLE_BASE_URL` | IOPscience proxy `/article` URL | Base URL used for `10.1088` DOI routes. |
-| `RSC_ARTICLE_CODE_PATTERN` | Compiled standard RSC article-code pattern | Extracts the decade, year digit, and journal code used to build a stable article-landing URL. |
-| `RSC_DECADE_START_YEARS` | `a` through `d` map to 1990 through 2020 | Converts the leading RSC article-code letter into a publication decade. |
+The current script includes endpoint constants for ScienceDirect, ACS, Wiley,
+the Physiological Society Wiley site, SAGE, PNAS, ASM, IEEE, Liebert/SAGE,
+Taylor & Francis, RSC, IOPscience, Optica, AIP Publishing, The Company of
+Biologists, and JoVE. It also keeps deterministic route helpers for publishers
+such as RSC and publisher-specific DOI families.
+
+Normally these values should not be changed unless a publisher changes its URL
+structure or the institutional proxy hostname changes.
 
 ## Enum and state reference
 
@@ -635,8 +647,9 @@ This is the only Python `Enum` defined by the script.
 | --- | --- | --- |
 | `PublisherOpenStatus.OPENED` | `"opened"` | The URL opened or an automatic PDF click was initiated successfully. |
 | `PublisherOpenStatus.REQUEST_BLOCKED` | `"request_blocked"` | The configured ScienceDirect request-error page was detected; recovery may run. |
-| `PublisherOpenStatus.DOWNLOAD_UNAVAILABLE` | `"download_unavailable"` | The publisher reports that downloading is unavailable or returns a configured terminal status such as Springer `404`; the row is skipped immediately. |
-| `PublisherOpenStatus.AUTOMATION_FAILED` | `"automation_failed"` | Chrome automation was unavailable or failed; `open_url()` falls back to the default browser. |
+| `PublisherOpenStatus.DOWNLOAD_UNAVAILABLE` | `"download_unavailable"` | The publisher reports that PDF downloading is unavailable; the row is skipped immediately. |
+| `PublisherOpenStatus.NOT_FOUND` | `"not_found"` | The publisher page clearly reports that the article or DOI does not exist; the result is recorded as terminal and non-retryable. |
+| `PublisherOpenStatus.AUTOMATION_FAILED` | `"automation_failed"` | Chrome automation was unavailable or failed; the script uses its fallback browser behavior. |
 | `PublisherOpenStatus.HTTP_ERROR` | `"http_error"` | Publisher automation observed an HTTP error response; the row is recorded with an `http_<status>` failure code. |
 
 ### CSV state values
@@ -646,8 +659,8 @@ These are strings written to the CSV, not Python Enums.
 | Field | Available values | Meaning |
 | --- | --- | --- |
 | `fetch_status` | `pending`, `success`, `skipped`, `failed` | Lifecycle/result state described in the Output section. |
-| `fetch_source` | `browser`, `auto_skip`, `existing`, `validation`, `skip_rule`, `publisher_circuit_breaker` | Component that produced the row result. |
-| `fetch_error` | Empty; validation/skip codes such as `invalid_pmid`, `invalid_doi`, `duplicate_pmid`, `manually_skipped`, `download_not_detected`, `publisher_download_unavailable`, `publisher_circuit_open`, and `blocked_url_pattern:<pattern>`; `http_<status>`; or a ScienceDirect recovery failure | Machine-readable reason; empty means no error was recorded. Detailed classification is available in the structured error columns. |
+| `fetch_source` | Values include `browser`, `auto_skip`, `existing`, `validation`, `skip_rule`, `publisher_circuit_breaker`, `publisher_not_found`, and `user_persistent_skip` | Component that produced the row result. |
+| `fetch_error` | Empty or a machine-readable validation, skip, timeout, publisher, HTTP, not-found, or recovery code | Machine-readable reason; empty means no error was recorded. Detailed classification is available in the structured error columns. |
 
 ### Internal record fields
 
@@ -667,6 +680,7 @@ These are strings written to the CSV, not Python Enums.
 | `PublisherClickRule` | `download_ready_selector` | Optional readiness control that must have a value before a second-stage download button is clicked. |
 | `PublisherClickRule` | `public_host` | Optional public hostname that should be replaced with `proxy_host` before clicking. |
 | `PublisherClickRule` | `proxy_host` | Optional institutional proxy hostname used for the public-to-proxy handoff. |
+| `PublisherClickRule` | `proxy_path_replacements` | Optional path substitutions applied when handing a public publisher URL to its institutional proxy route. |
 | `PublisherClickRule` | `click_timeout_seconds` | Optional per-publisher override for the global click timeout; currently RSC uses 90 seconds. |
 | `FileSnapshot` | `size` | Observed file size in bytes. |
 | `FileSnapshot` | `modified_ns` | File modification timestamp in nanoseconds. |
@@ -722,15 +736,13 @@ To disable scheduled cache cleanup entirely:
 AUTO_CLEAR_BROWSER_CACHE = False
 ```
 
-## ScienceDirect request-error recovery
+## Publisher request-error recovery
 
-The ScienceDirect rule detects an error page containing:
+Supported publisher rules can detect configured request-limit/error pages and
+retry the affected article.
 
-```text
-There was a problem providing the content you requested
-```
-
-When detected, the script:
+ScienceDirect uses the strongest recovery path. When its configured request
+error is detected, the script:
 
 1. Closes ScienceDirect tabs.
 2. Stops Chrome.
@@ -739,13 +751,21 @@ When detected, the script:
 5. Waits `DOWNLOAD_BREAK_SECONDS`.
 6. Retries the same article.
 
-Recovery is attempted at most
-`SCIENCEDIRECT_REQUEST_ERROR_MAX_RETRIES` times. The row is marked failed if
-retries are exhausted or cleanup/restart does not fully complete.
+Other supported publishers use a lighter recovery path that closes the affected
+automatic tab, waits, and retries without globally clearing Chrome data.
 
-Because recovery clears all cookies, be prepared to sign in through OSU again.
-Local cleanup also cannot remove a server-side publisher or IP restriction. Do
-not use other devices, networks, or addresses to evade publisher limits.
+Optica Publishing Group also supports cooldown and queue deferral. A rate-limited
+Optica record can be appended to the queue again while other publishers are
+processed, up to `OPTICA_RATE_LIMIT_MAX_DEFERRALS`. Successful Optica downloads
+also trigger a scheduled cooldown after each configured burst.
+
+Recovery is attempted at most
+`SCIENCEDIRECT_REQUEST_ERROR_MAX_RETRIES` times for the normal retry path. A row
+is marked failed if retries are exhausted.
+
+Because ScienceDirect recovery clears all cookies, be prepared to sign in
+through OSU again. Local cleanup or waiting cannot remove a server-side
+publisher or IP restriction; respect publisher access limits and terms.
 
 ## Other operating systems and browsers
 
@@ -768,6 +788,8 @@ The scheduled download break works independently of browser automation.
 
 ### A page opens but nothing downloads
 
+- If the terminal shows `[DOWNLOAD IN PROGRESS]`, the browser has started a
+  temporary download and the script is still waiting for completion.
 - Complete any institutional or publisher login prompt.
 - Dismiss a consent dialog that covers the PDF control.
 - Click the PDF or Download control manually.

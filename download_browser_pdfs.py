@@ -29,6 +29,7 @@ RUN_ID = datetime.now().astimezone().strftime("%Y%m%dT%H%M%S%z")
 PMID_COLUMN = "pmid"
 DOI_COLUMN = "doi"
 IS_FETCH_TARGET_COLUMN = "is_fetch_target"
+SKIP_FUTURE_RUNS_COLUMN = "skip_future_runs"
 FETCH_STATUS_COLUMN = "fetch_status"
 FETCH_SOURCE_COLUMN = "fetch_source"
 FETCH_ERROR_COLUMN = "fetch_error"
@@ -47,6 +48,7 @@ OUTPUT_PATH_COLUMN = "output_path"
 TARGET_ENABLED_VALUE = "Y"
 
 DOWNLOAD_RESULT_FIELDS = [
+    SKIP_FUTURE_RUNS_COLUMN,
     FETCH_STATUS_COLUMN,
     FETCH_SOURCE_COLUMN,
     FETCH_ERROR_COLUMN,
@@ -81,6 +83,7 @@ class PublisherClickRule:
     download_ready_selector: str | None = None
     public_host: str | None = None
     proxy_host: str | None = None
+    proxy_path_replacements: tuple[tuple[str, str], ...] = ()
     click_timeout_seconds: int | None = None
 
 
@@ -101,6 +104,7 @@ class PublisherOpenStatus(Enum):
     OPENED = "opened"
     REQUEST_BLOCKED = "request_blocked"
     DOWNLOAD_UNAVAILABLE = "download_unavailable"
+    NOT_FOUND = "not_found"
     AUTOMATION_FAILED = "automation_failed"
     HTTP_ERROR = "http_error"
 
@@ -230,6 +234,9 @@ OVERRIDE_EXISTING_DOWNLOAD_URLS = False
 OPEN_DELAY_SECONDS = 5
 WAIT_TIMEOUT_SECONDS = 15
 POLL_INTERVAL_SECONDS = 2
+IN_PROGRESS_DOWNLOAD_TIMEOUT_SECONDS = 900
+IN_PROGRESS_DOWNLOAD_STALL_SECONDS = 120
+DOWNLOAD_PROGRESS_REPORT_SECONDS = 15
 MIN_FILE_SIZE_BYTES = 1024
 INTERACTIVE_SKIP = True
 # Opt-in unattended mode. After the normal wait expires, a record is marked
@@ -243,10 +250,15 @@ OPEN_COMMAND: str | None = None
 # Append-only, machine-readable history for later failure-pattern analysis.
 BATCH_LOG_PATH: Path | None = PROJECT_ROOT / "download_events.jsonl"
 # Matching URLs are recorded as skipped instead of silently disappearing.
-BLOCKED_URL_PATTERNS = ["onlinelibrary-wiley-com", "pubs-acs-org", "10.1177", "link.springer.com", "karger.com", "10.1159", "ashpublications.org", "ascopubs.org", "neurology.org", "auajournals.org", "10.1158", "ovid.com", "jamaoto", "jamaoncol", "eurekaselect.com", "ersnet.org", "10.23736", "degruyterbrill.com", "dustri.com"]
+BLOCKED_URL_PATTERNS = ["chndoi.org", "jstage.jst.go.jp", "asmedigitalcollection.asme.org", "10.1115", "profile.thieme.de", "thieme-connect.de", 
+                        "eurekaselect.com", "10.2174", "eurekaselect.com", "ieeexplore.ieee.org", "10.1089", "10.64898", "10.1126", "10.1016", 
+                        # "onlinelibrary-wiley-com", "pubs-acs-org", "10.1177", "link.springer.com", "karger.com", "10.1159", "ashpublications.org", 
+                        "ascopubs.org", "neurology.org", "auajournals.org", "10.1158", "ovid.com", "jamaoto", "jamaoncol", 
+                        "ersnet.org", "10.23736", "degruyterbrill.com", "dustri.com"]
 # Matching URLs remain in the queue but run in the manual-review tier.
 MANUAL_URL_PATTERNS = [] #"link.springer.com"
 AUTOMATE_PUBLISHER_PDF_CLICK = True
+TRY_OSU_PROXY_FOR_UNCUSTOMIZED_URLS = True
 PUBLISHER_CLICK_TIMEOUT_SECONDS = 20
 DOI_RESOLUTION_MIN_INTERVAL_SECONDS = 1.5
 DOI_RESOLUTION_JITTER_SECONDS = 0.75
@@ -259,6 +271,9 @@ CLEAR_COOKIES_WITH_CACHE = True
 DOWNLOAD_BREAK_EVERY_FILES = 100
 DOWNLOAD_BREAK_SECONDS = 30
 SCIENCEDIRECT_REQUEST_ERROR_MAX_RETRIES = 3
+OPTICA_DOWNLOADS_PER_BURST = 5
+OPTICA_COOLDOWN_SECONDS = 300
+OPTICA_RATE_LIMIT_MAX_DEFERRALS = 3
 # Publisher circuits only use explicit response/block signals. Ordinary
 # timeouts, 401s, and 404s never disable an entire publisher.
 PUBLISHER_CIRCUIT_THRESHOLDS = {
@@ -318,8 +333,10 @@ AUTO_PUBLISHER_PRIORITY = {
     "JCI Insight": 140,
     "PLOS": 145,
     "Oncotarget": 147,
+    "PNAS": 147,
+    "ASM Journals": 147,
     "ACP Journals": 149,
-    "ScienceDirect": 0,
+    "ScienceDirect": 150,
 }
 
 DIRECT_PDF_PRIORITY = 200
@@ -350,9 +367,21 @@ ACS_PROXY_HOST = "pubs-acs-org.proxy.lib.ohio-state.edu"
 ACS_ARTICLE_BASE_URL = f"https://{ACS_PROXY_HOST}/doi/full"
 WILEY_PROXY_HOST = "onlinelibrary-wiley-com.proxy.lib.ohio-state.edu"
 WILEY_ARTICLE_BASE_URL = f"https://{WILEY_PROXY_HOST}/doi/full"
+PHYSOC_WILEY_PROXY_HOST = (
+    "physoc-onlinelibrary-wiley-com.proxy.lib.ohio-state.edu"
+)
+PHYSOC_WILEY_ARTICLE_BASE_URL = f"https://{PHYSOC_WILEY_PROXY_HOST}/doi/full"
 SAGE_PROXY_HOST = "journals-sagepub-com.proxy.lib.ohio-state.edu"
 SAGE_ARTICLE_BASE_URL = f"https://{SAGE_PROXY_HOST}/doi/full"
-LIEBERT_ARTICLE_BASE_URL = "https://www.liebertpub.com/doi/pdf"
+PNAS_PROXY_HOST = "www-pnas-org.proxy.lib.ohio-state.edu"
+PNAS_READER_BASE_URL = f"https://{PNAS_PROXY_HOST}/doi/epub"
+ASM_PUBLIC_HOST = "journals.asm.org"
+ASM_READER_BASE_URL = f"https://{ASM_PUBLIC_HOST}/doi/epub"
+IEEE_PUBLIC_HOST = "ieeexplore.ieee.org"
+IEEE_PROXY_HOST = "ieeexplore-ieee-org.proxy.lib.ohio-state.edu"
+# Liebert journal content now uses the SAGE-hosted Literatum reader. Start at
+# the proxied article route so Chrome can click PDF/EPUB and then Download PDF.
+LIEBERT_ARTICLE_BASE_URL = f"https://{SAGE_PROXY_HOST}/doi"
 TANDF_PROXY_HOST = "www-tandfonline-com.proxy.lib.ohio-state.edu"
 TANDF_ARTICLE_BASE_URL = f"https://{TANDF_PROXY_HOST}/doi/full"
 RSC_PUBLIC_HOST = "pubs.rsc.org"
@@ -360,6 +389,20 @@ RSC_PROXY_HOST = "pubs-rsc-org.proxy.lib.ohio-state.edu"
 IOP_PUBLIC_HOST = "iopscience.iop.org"
 IOP_PROXY_HOST = "iopscience-iop-org.proxy.lib.ohio-state.edu"
 IOP_ARTICLE_BASE_URL = f"https://{IOP_PROXY_HOST}/article"
+OPTICA_PUBLIC_HOST = "opg.optica.org"
+OPTICA_PROXY_HOST = "opg-optica-org.proxy.lib.ohio-state.edu"
+AIP_PUBLIC_HOST = "pubs.aip.org"
+AIP_PROXY_HOST = "pubs-aip-org.proxy.lib.ohio-state.edu"
+AIP_ARTICLE_BASE_URL = f"https://{AIP_PROXY_HOST}/doi"
+COMPANY_BIOLOGISTS_PUBLIC_HOST = "journals.biologists.com"
+COMPANY_BIOLOGISTS_PROXY_HOST = (
+    "journals-biologists-com.proxy.lib.ohio-state.edu"
+)
+JCS_ARTICLE_LOOKUP_BASE_URL = (
+    f"https://{COMPANY_BIOLOGISTS_PROXY_HOST}/jcs/article-lookup/doi"
+)
+JOVE_PUBLIC_HOST = "www.jove.com"
+JOVE_PROXY_HOST = "www-jove-com.proxy.lib.ohio-state.edu"
 RSC_ARTICLE_CODE_PATTERN = re.compile(
     r"^(?P<decade>[a-d])(?P<year>\d)(?P<journal>[a-z]{2})[a-z0-9]+$",
     re.IGNORECASE,
@@ -372,19 +415,27 @@ RSC_DECADE_START_YEARS = {
 }
 
 TEMP_SUFFIXES = {".crdownload", ".part", ".download", ".tmp"}
+TERMINAL_NOT_FOUND_ERROR_CODES = {
+    "article_not_found",
+    "doi_not_found",
+    "http_404",
+}
 
 DOI_PREFIX_RULES: list[tuple[str, str]] = [
+    ("10.1063/", f"{AIP_ARTICLE_BASE_URL}/{{doi}}"),
+    ("10.1242/jcs.", f"{JCS_ARTICLE_LOOKUP_BASE_URL}/{{doi}}"),
     ("10.3390/", "https://www.mdpi.com/article/{doi}/pdf"),
     ("10.1007/", "https://link.springer.com/content/pdf/{doi}.pdf"),
     ("10.1038/", "https://link.springer.com/content/pdf/{doi}.pdf"),
     ("10.1002/", f"{WILEY_ARTICLE_BASE_URL}/{{doi}}"),
     ("10.1111/", f"{WILEY_ARTICLE_BASE_URL}/{{doi}}"),
+    ("10.1113/", f"{PHYSOC_WILEY_ARTICLE_BASE_URL}/{{doi}}"),
     ("10.1096/", f"{WILEY_ARTICLE_BASE_URL}/{{doi}}"),
     ("10.1021/", f"{ACS_ARTICLE_BASE_URL}/{{doi}}"),
     ("10.3389/", "https://www.frontiersin.org/articles/{doi}/pdf"),
-    ("10.1073/", "https://www.pnas.org/doi/pdf/{doi}"),
+    ("10.1073/", f"{PNAS_READER_BASE_URL}/{{doi}}"),
     ("10.1126/", "https://www.science.org/doi/pdf/{doi}"),
-    ("10.1128/", "https://journals.asm.org/doi/pdf/{doi}"),
+    ("10.1128/", f"{ASM_READER_BASE_URL}/{{doi}}"),
     ("10.1089/", f"{LIEBERT_ARTICLE_BASE_URL}/{{doi}}"),
     ("10.1080/", f"{TANDF_ARTICLE_BASE_URL}/{{doi}}"),
     ("10.1088/", f"{IOP_ARTICLE_BASE_URL}/{{doi}}"),
@@ -395,6 +446,16 @@ DOI_PREFIX_RULES: list[tuple[str, str]] = [
 # follows the redirect. They also let blocked publisher domains match before
 # the browser opens the DOI URL.
 DOI_REDIRECT_HOST_HINTS: list[tuple[str, str]] = [
+    ("10.1063/", "pubs.aip.org"),
+    ("10.1364/", "opg.optica.org"),
+    ("10.14573/", "www.altex.org"),
+    ("10.1113/", "physoc.onlinelibrary.wiley.com"),
+    ("10.1242/", COMPANY_BIOLOGISTS_PUBLIC_HOST),
+    ("10.3791/", JOVE_PUBLIC_HOST),
+    ("10.64898/", "www.biorxiv.org"),
+    ("10.34172/", "bi.tbzmed.ac.ir"),
+    ("10.34133/", "spj.science.org"),
+    ("10.1109/", IEEE_PUBLIC_HOST),
     ("10.1016/", "www.sciencedirect.com"),
     ("10.1039/", "pubs.rsc.org"),
     ("10.1001/amajethics.", "journalofethics.ama-assn.org"),
@@ -560,19 +621,38 @@ def rewrite_resolved_url(url: str, fallback_doi: str = "") -> str:
     if host == IOP_PUBLIC_HOST:
         return parsed._replace(netloc=IOP_PROXY_HOST).geturl()
 
+    if host == OPTICA_PUBLIC_HOST:
+        optica_path = path.replace("/abstract.cfm", "/fulltext.cfm", 1)
+        return parsed._replace(
+            netloc=OPTICA_PROXY_HOST,
+            path=optica_path,
+        ).geturl()
+
+    if host == AIP_PUBLIC_HOST:
+        return parsed._replace(netloc=AIP_PROXY_HOST).geturl()
+
+    if host == COMPANY_BIOLOGISTS_PUBLIC_HOST:
+        return parsed._replace(netloc=COMPANY_BIOLOGISTS_PROXY_HOST).geturl()
+
+    if host == JOVE_PUBLIC_HOST:
+        return parsed._replace(netloc=JOVE_PROXY_HOST).geturl()
+
     if host == "elifesciences.org" and "/articles/" in path:
         article_id = path.split("/articles/", 1)[1].split("/", 1)[0]
         if article_id and not article_id.endswith(".pdf"):
             return f"https://elifesciences.org/articles/{article_id}.pdf"
 
-    if host in ("pnas.org", "www.pnas.org") and doi:
-        return f"https://www.pnas.org/doi/pdf/{quoted_doi}"
+    if (
+        host == "pnas.org"
+        or is_public_or_osu_proxy_host(host, "www.pnas.org")
+    ) and doi:
+        return f"{PNAS_READER_BASE_URL}/{quoted_doi}"
 
     if host in ("science.org", "www.science.org") and doi:
         return f"https://www.science.org/doi/pdf/{quoted_doi}"
 
-    if host == "journals.asm.org" and doi:
-        return f"https://journals.asm.org/doi/pdf/{quoted_doi}"
+    if is_public_or_osu_proxy_host(host, ASM_PUBLIC_HOST) and doi:
+        return f"{ASM_READER_BASE_URL}/{quoted_doi}"
 
     if is_sage_host(host) and doi:
         return f"{SAGE_ARTICLE_BASE_URL}/{quoted_doi}"
@@ -641,6 +721,10 @@ def prepare_pdf_url_locally(doi: str) -> str:
     if doi.casefold().startswith("10.7554/elife."):
         article_id = doi.rsplit(".", 1)[-1]
         return f"https://elifesciences.org/articles/{article_id}.pdf"
+    if doi.casefold().startswith("10.3791/"):
+        article_id = doi.split("/", 1)[1].strip()
+        if article_id:
+            return f"https://{JOVE_PROXY_HOST}/t/{quote(article_id, safe='')}"
     rsc_url = rsc_proxy_article_url(doi)
     if rsc_url:
         return rsc_url
@@ -773,6 +857,7 @@ def resolve_best_pdf_url(doi: str, resolve_timeout: float = 8.0) -> str:
 
     print(f"  [RESOLVE {resolved_method}] {doi_url} -> {resolved}")
     rewritten = rewrite_resolved_url(resolved, fallback_doi=doi)
+    rewritten = generic_osu_proxy_url(rewritten)
     if rewritten != resolved:
         print(f"  [REWRITE] -> {rewritten}")
     log_event(
@@ -859,13 +944,49 @@ def file_snapshot(path: Path) -> FileSnapshot | None:
     return FileSnapshot(size=stat.st_size, modified_ns=stat.st_mtime_ns)
 
 
-def snapshot_completed_files(directory: Path) -> dict[Path, FileSnapshot]:
+def snapshot_download_files(directory: Path) -> dict[Path, FileSnapshot]:
+    """Snapshot completed and temporary files before opening an article."""
     snapshot: dict[Path, FileSnapshot] = {}
-    for path in completed_files(directory):
-        state = file_snapshot(path)
-        if state is not None:
-            snapshot[path.resolve()] = state
+    try:
+        paths = directory.iterdir()
+        for path in paths:
+            try:
+                if not path.is_file():
+                    continue
+                state = file_snapshot(path)
+                if state is not None:
+                    snapshot[path.resolve()] = state
+            except OSError:
+                continue
+    except OSError as exc:
+        print(f"  [WATCH] unable to snapshot {directory}: {exc}")
     return snapshot
+
+
+def active_temporary_downloads(
+    directory: Path,
+    known: Mapping[Path, FileSnapshot],
+) -> dict[Path, FileSnapshot]:
+    """Return temporary downloads created or changed after the snapshot."""
+    active: dict[Path, FileSnapshot] = {}
+    try:
+        paths = directory.iterdir()
+        for path in paths:
+            try:
+                if (
+                    not path.is_file()
+                    or path.suffix.casefold() not in TEMP_SUFFIXES
+                ):
+                    continue
+                resolved_path = path.resolve()
+                state = file_snapshot(path)
+                if state is not None and state != known.get(resolved_path):
+                    active[resolved_path] = state
+            except OSError:
+                continue
+    except OSError as exc:
+        print(f"  [WATCH] unable to inspect active downloads: {exc}")
+    return active
 
 
 def is_pdf_file(path: Path) -> bool:
@@ -889,34 +1010,43 @@ def expected_sciencedirect_pii(url: str) -> str:
     return parsed.path.split("/pii/", 1)[1].strip("/").split("/", 1)[0]
 
 
-def read_skip_nonblocking() -> bool:
+def read_skip_action_nonblocking() -> str:
+    """Return ``s`` for this-run skip or ``p`` for persistent skip."""
     if not sys.stdin.isatty():
-        return False
+        return ""
 
     if os.name == "nt":
         # On Windows, select() only accepts sockets, not console input.
         import msvcrt
 
         if not msvcrt.kbhit():
-            return False
-        return msvcrt.getwch().lower() == "s"
+            return ""
+        action = msvcrt.getwch().lower()
+        return action if action in {"s", "p"} else ""
 
     ready, _, _ = select.select([sys.stdin], [], [], 0)
     if not ready:
-        return False
-    return sys.stdin.readline().strip().lower() == "s"
+        return ""
+    action = sys.stdin.readline().strip().lower()
+    return action if action in {"s", "p"} else ""
 
 
 def wait_for_download(
     known: Mapping[Path, FileSnapshot],
     expected_url: str = "",
-) -> tuple[Path | None, bool]:
-    deadline = time.monotonic() + WAIT_TIMEOUT_SECONDS
+) -> tuple[Path | None, str]:
+    discovery_deadline = time.monotonic() + WAIT_TIMEOUT_SECONDS
+    progress_deadline: float | None = None
+    last_progress_at: float | None = None
+    last_progress_report_at = 0.0
+    previous_temporary_states: dict[Path, FileSnapshot] = {}
     expected_pii = expected_sciencedirect_pii(expected_url).casefold()
     reported_mismatches: set[tuple[Path, int]] = set()
-    while time.monotonic() < deadline:
-        if INTERACTIVE_SKIP and read_skip_nonblocking():
-            return None, True
+    while True:
+        if INTERACTIVE_SKIP:
+            skip_action = read_skip_action_nonblocking()
+            if skip_action:
+                return None, skip_action
 
         candidates: list[tuple[Path, FileSnapshot]] = []
         for path in completed_files(WATCH_DIR):
@@ -938,11 +1068,52 @@ def wait_for_download(
 
         if candidates:
             newest, _ = max(candidates, key=lambda item: item[1].modified_ns)
-            return newest, False
+            return newest, ""
+
+        now = time.monotonic()
+        temporary_states = active_temporary_downloads(WATCH_DIR, known)
+        if temporary_states:
+            if progress_deadline is None:
+                progress_deadline = now + IN_PROGRESS_DOWNLOAD_TIMEOUT_SECONDS
+                last_progress_at = now
+                names = ", ".join(path.name for path in temporary_states)
+                print(
+                    f"  [DOWNLOAD IN PROGRESS] {names}; waiting for Chrome "
+                    "to finish",
+                    flush=True,
+                )
+            if temporary_states != previous_temporary_states:
+                last_progress_at = now
+            if now - last_progress_report_at >= DOWNLOAD_PROGRESS_REPORT_SECONDS:
+                total_bytes = sum(state.size for state in temporary_states.values())
+                print(
+                    f"  [DOWNLOAD PROGRESS] {total_bytes} bytes received; "
+                    "still waiting",
+                    flush=True,
+                )
+                last_progress_report_at = now
+            previous_temporary_states = temporary_states
+            if progress_deadline is not None and now >= progress_deadline:
+                print(
+                    f"  [DOWNLOAD LIMIT] still incomplete after "
+                    f"{IN_PROGRESS_DOWNLOAD_TIMEOUT_SECONDS}s",
+                    flush=True,
+                )
+                return None, ""
+            if (
+                last_progress_at is not None
+                and now - last_progress_at >= IN_PROGRESS_DOWNLOAD_STALL_SECONDS
+            ):
+                print(
+                    f"  [DOWNLOAD STALLED] temporary file did not change for "
+                    f"{IN_PROGRESS_DOWNLOAD_STALL_SECONDS}s",
+                    flush=True,
+                )
+                return None, ""
+        elif now >= discovery_deadline:
+            return None, ""
 
         time.sleep(POLL_INTERVAL_SECONDS)
-
-    return None, False
 
 
 def log_event(payload: Mapping[str, object]) -> None:
@@ -1376,6 +1547,52 @@ def recover_from_sciencedirect_request_error(
     return True
 
 
+def recover_from_publisher_request_error(
+    *,
+    publisher: str,
+    pmid: str,
+    url: str,
+    retry_number: int,
+) -> bool:
+    """Pause and retry a publisher block without applying unsafe global cleanup."""
+    if publisher == "ScienceDirect":
+        return recover_from_sciencedirect_request_error(
+            pmid=pmid,
+            url=url,
+            retry_number=retry_number,
+        )
+
+    print(
+        "\n============================================================\n"
+        f"[{publisher.upper()} REQUEST LIMIT]\n"
+        "The publisher reported too many requests for this browser session.\n"
+        f"The current article will be retried ({retry_number}/"
+        f"{SCIENCEDIRECT_REQUEST_ERROR_MAX_RETRIES}).\n"
+        "============================================================",
+        flush=True,
+    )
+    log_event(
+        {
+            "event": "publisher_request_error_recovery",
+            "publisher": publisher,
+            "pmid": pmid,
+            "url": url,
+            "retry_number": retry_number,
+            "started_at": now_timestamp(),
+        }
+    )
+    close_completed_automatic_tab(url)
+    if DOWNLOAD_BREAK_SECONDS > 0:
+        print(
+            f"  [RECOVERY WAIT] Waiting {DOWNLOAD_BREAK_SECONDS}s before "
+            f"retrying {publisher}.",
+            flush=True,
+        )
+        time.sleep(DOWNLOAD_BREAK_SECONDS)
+    print(f"  [RECOVERY RETRY] Reopening the same {publisher} article.", flush=True)
+    return True
+
+
 def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
     host = (urlparse(url).hostname or "").casefold()
     if is_doi_resolver_url(url):
@@ -1401,6 +1618,72 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
             ),
             direct_navigation=True,
             download_unavailable_statuses=(404,),
+        )
+    if is_public_or_osu_proxy_host(host, AIP_PUBLIC_HOST):
+        return PublisherClickRule(
+            publisher="AIP Publishing",
+            pdf_selector=(
+                'li.toolbar-item.item-pdf '
+                'a.article-pdfLink[data-doctype="contentPdf"]'
+                '[href*="/article-pdf/"], '
+                'a.article-pdfLink[data-doctype="contentPdf"]'
+                '[href*="/article-pdf/"]'
+            ),
+            public_host=AIP_PUBLIC_HOST,
+            proxy_host=AIP_PROXY_HOST,
+        )
+    if is_public_or_osu_proxy_host(host, COMPANY_BIOLOGISTS_PUBLIC_HOST):
+        return PublisherClickRule(
+            publisher="The Company of Biologists",
+            pdf_selector=(
+                'li.toolbar-item.item-pdf '
+                'a.article-pdfLink[data-doctype="contentPdf"]'
+                '[href*="/article-pdf/"], '
+                'a.article-pdfLink[data-doctype="contentPdf"]'
+                '[href*="/article-pdf/"]'
+            ),
+            public_host=COMPANY_BIOLOGISTS_PUBLIC_HOST,
+            proxy_host=COMPANY_BIOLOGISTS_PROXY_HOST,
+        )
+    if is_public_or_osu_proxy_host(host, JOVE_PUBLIC_HOST):
+        return PublisherClickRule(
+            publisher="JoVE",
+            pdf_selector=(
+                'button[data-atm="article-download-pdf"]'
+                '[aria-label="Download PDF"], '
+                'button.text-article-action-buttons-download-pdf-button'
+                '[aria-label="Download PDF"], '
+                'button[aria-label="Download PDF"]'
+                ':not([data-atm="article-download-pdf-menu"])'
+            ),
+            public_host=JOVE_PUBLIC_HOST,
+            proxy_host=JOVE_PROXY_HOST,
+        )
+    if is_public_or_osu_proxy_host(host, OPTICA_PUBLIC_HOST):
+        return PublisherClickRule(
+            publisher="Optica Publishing Group",
+            pdf_selector=(
+                'li.pdf-download a[href*="viewmedia.cfm"]'
+                '[aria-label="Pdf icon"], '
+                'li.pdf-download a[href*="viewmedia.cfm"]'
+            ),
+            request_error_selector="body",
+            request_error_text=(
+                "This IP address is subject to a downloading timeout based on "
+                "heavy usage"
+            ),
+            public_host=OPTICA_PUBLIC_HOST,
+            proxy_host=OPTICA_PROXY_HOST,
+            proxy_path_replacements=(("/abstract.cfm", "/fulltext.cfm"),),
+        )
+    if is_public_or_osu_proxy_host(host, "www.altex.org"):
+        return PublisherClickRule(
+            publisher="ALTEX",
+            pdf_selector=(
+                'ul.galleys_links a.obj_galley_link.pdf'
+                '[href*="/article/view/"], '
+                'a.obj_galley_link.pdf[href*="/article/view/"]'
+            ),
         )
     if host.endswith("sciencedirect.com") or host == SCIENCEDIRECT_PROXY_HOST:
         return PublisherClickRule(
@@ -1467,6 +1750,72 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
                 'a[href*="/doi/pdf/"]'
             ),
         )
+    if is_public_or_osu_proxy_host(host, "spj.science.org"):
+        return PublisherClickRule(
+            publisher="Science Partner Journals",
+            pdf_selector=(
+                'div.info-panel__formats a.btn[aria-label="PDF"]'
+                '[href*="/doi/reader/"], '
+                'a[aria-label="PDF"][href*="/doi/reader/"]'
+            ),
+            download_selector=(
+                'a.navbar-download[data-single-download="true"]'
+                '[data-download-files-key="pdf"][href*="/doi/pdf/"], '
+                'a[aria-label^="Download PDF"]'
+                '[href*="/doi/pdf/"][href*="download=true"], '
+                'a[data-download-files-key="pdf"][href*="/doi/pdf/"]'
+            ),
+        )
+    if is_public_or_osu_proxy_host(host, "www.biorxiv.org"):
+        return PublisherClickRule(
+            publisher="bioRxiv",
+            pdf_selector=(
+                'a.article-dl-pdf-link[href*="/content/"]'
+                '[href$=".full.pdf"], '
+                'a.link-icon[href*="/content/"][href$=".full.pdf"]'
+            ),
+            request_error_selector="body",
+            request_error_text=(
+                "We have received a high number of requests from this session."
+            ),
+        )
+    if is_public_or_osu_proxy_host(host, "bi.tbzmed.ac.ir"):
+        return PublisherClickRule(
+            publisher="BioImpacts",
+            pdf_selector=(
+                'a#ctl00_ContentPlaceHolder_Right_download_pdf'
+                '[href^="/PDF/"][href$=".pdf"], '
+                'a[itemprop="url"][href^="/PDF/"][href$=".pdf"]'
+            ),
+        )
+    if is_public_or_osu_proxy_host(host, IEEE_PUBLIC_HOST):
+        return PublisherClickRule(
+            publisher="IEEE Xplore",
+            pdf_selector=(
+                'a.xpl-btn-pdf[href^="/stamp/stamp.jsp?"]'
+                '[href*="arnumber="], '
+                'a[data-analytics_identifier='
+                '"document-lh-action-downloadpdf"]'
+                ':not([title*="do not have access"]), '
+                'a.xpl-btn-pdf.doc-actions-link'
+                ':not([title*="do not have access"])'
+            ),
+            download_selector=(
+                'a[href*="/stampPDF/getPDF.jsp?"]'
+                '[href*="arnumber="][target="_blank"], '
+                'a[href*="/stampPDF/getPDF.jsp?"]'
+                '[href*="arnumber="]:has(> button#open-button)'
+            ),
+            download_unavailable_selector=(
+                'a[data-analytics_identifier='
+                '"document-lh-action-downloadpdf"]'
+                '[title*="do not have access"], '
+                'a.xpl-btn-pdf.doc-actions-link'
+                '[title*="do not have access"]'
+            ),
+            public_host=IEEE_PUBLIC_HOST,
+            proxy_host=IEEE_PROXY_HOST,
+        )
     if is_wiley_host(host):
         return PublisherClickRule(
             publisher="Wiley",
@@ -1513,6 +1862,28 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
                 'a#favourite-download[href*="/doi/pdf/"], '
                 'a[aria-label^="Download PDF"][href*="/doi/pdf/"]'
             ),
+        )
+    if host == "pnas.org" or is_public_or_osu_proxy_host(host, "www.pnas.org"):
+        reader_download_selector = (
+            'a.download[data-single-download="true"]'
+            '[data-download-files-key="pdf"]'
+            '[href*="/doi/pdf/"][href*="download=true"]'
+        )
+        return PublisherClickRule(
+            publisher="PNAS",
+            pdf_selector=reader_download_selector,
+            download_selector=reader_download_selector,
+        )
+    if is_public_or_osu_proxy_host(host, ASM_PUBLIC_HOST):
+        reader_download_selector = (
+            'a.download[data-single-download="true"]'
+            '[data-download-files-key="pdf"]'
+            '[href*="/doi/pdf/"][href*="download=true"]'
+        )
+        return PublisherClickRule(
+            publisher="ASM Journals",
+            pdf_selector=reader_download_selector,
+            download_selector=reader_download_selector,
         )
     if host == RSC_PUBLIC_HOST or host.endswith(
         "-rsc-org.proxy.lib.ohio-state.edu"
@@ -1712,6 +2083,40 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
     return None
 
 
+def generic_osu_proxy_url(url: str) -> str:
+    """Try EZproxy first for an otherwise uncustomized article-page URL."""
+    if not TRY_OSU_PROXY_FOR_UNCUSTOMIZED_URLS or not is_http_url(url):
+        return url
+    parsed = urlsplit(url)
+    host = (parsed.hostname or "").casefold()
+    path = parsed.path.casefold()
+    if (
+        not host
+        or is_doi_resolver_url(url)
+        or host == "localhost"
+        or host.endswith(".localhost")
+        or host.endswith(".proxy.lib.ohio-state.edu")
+        or host.endswith(".ohio-state.edu")
+        or re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", host)
+        or ":" in host
+        or publisher_pdf_click_rule(url) is not None
+    ):
+        return url
+    direct_pdf_patterns = (
+        "/article-pdf/",
+        "/content/pdf/",
+        "/doi/pdf/",
+        "/pdf/",
+        "/pdfft/",
+    )
+    if path.endswith(".pdf") or any(
+        pattern in path for pattern in direct_pdf_patterns
+    ):
+        return url
+    proxy_host = f"{host.replace('.', '-')}.proxy.lib.ohio-state.edu"
+    return parsed._replace(netloc=proxy_host).geturl()
+
+
 def download_strategy(url: str) -> DownloadStrategy:
     """Classify a prepared URL into the automatic or manual-review tier."""
     parsed = urlparse(url)
@@ -1785,6 +2190,7 @@ def open_publisher_and_click_pdf(
     download_ready_selector: str | None = None,
     public_host: str | None = None,
     proxy_host: str | None = None,
+    proxy_path_replacements: tuple[tuple[str, str], ...] = (),
     configured_click_timeout_seconds: int | None = None,
 ) -> PublisherOpenResult:
     """Open a publisher article and click through to its final PDF download."""
@@ -1815,13 +2221,27 @@ def open_publisher_and_click_pdf(
   const downloadReadySelector = __DOWNLOAD_READY_SELECTOR__;
   const publicHost = __PUBLIC_HOST__;
   const proxyHost = __PROXY_HOST__;
+  const proxyPathReplacements = __PROXY_PATH_REPLACEMENTS__;
   const navigationEntry = performance.getEntriesByType('navigation')[0];
   const responseStatus = Number(navigationEntry?.responseStatus || 0);
   if (responseStatus >= 400) return `http_error:${responseStatus}`;
 
+  const bodyText = document.body?.textContent?.replace(/\s+/g, ' ').trim() || '';
+  if (bodyText.length > 0 && bodyText.length < 5000) {
+    if (/Article with doi\s+10\.[^\s]+\s+not found/i.test(bodyText)) {
+      return 'not_found:article_not_found';
+    }
+    if (/\bDOI Not Found\b/i.test(bodyText)) {
+      return 'not_found:doi_not_found';
+    }
+  }
+
   if (publicHost && proxyHost && window.location.hostname === publicHost) {
     const proxyUrl = new URL(window.location.href);
     proxyUrl.hostname = proxyHost;
+    for (const [oldPath, newPath] of proxyPathReplacements) {
+      proxyUrl.pathname = proxyUrl.pathname.replace(oldPath, newPath);
+    }
     window.location.replace(proxyUrl.href);
     return 'proxy_navigation_started';
   }
@@ -1889,6 +2309,11 @@ def open_publisher_and_click_pdf(
       downloadReadyElement?.value
     );
     if (downloadLink && downloadIsReady) {
+      const trustedOpenButton = downloadLink.querySelector('button#open-button');
+      if (trustedOpenButton) {
+        trustedOpenButton.focus();
+        return 'trusted_download_ready';
+      }
       downloadLink.target = '_self';
       downloadLink.click();
       return 'download_clicked';
@@ -1908,6 +2333,15 @@ def open_publisher_and_click_pdf(
   if (!link) return 'waiting';
   if (link.dataset.automatedPdfClick === 'true') return 'waiting';
   link.dataset.automatedPdfClick = 'true';
+  const trustedPdfButton = link.matches(
+    'button[data-atm="article-download-pdf"][aria-label="Download PDF"], ' +
+    'button.text-article-action-buttons-download-pdf-button' +
+    '[aria-label="Download PDF"]'
+  );
+  if (trustedPdfButton) {
+    link.focus();
+    return 'trusted_pdf_button_ready';
+  }
   const legacyScienceDirectLink = link.closest('li.ViewPDF') !== null;
   const wileyEpdfLink = link.matches(
     'a.pdf-download[href*="/doi/epdf/"], a[title="ePDF"][href*="/doi/epdf/"]'
@@ -1961,6 +2395,9 @@ def open_publisher_and_click_pdf(
         "__PROXY_HOST__",
         json.dumps(proxy_host),
     ).replace(
+        "__PROXY_PATH_REPLACEMENTS__",
+        json.dumps(proxy_path_replacements),
+    ).replace(
         "__PDF_SELECTOR__", json.dumps(selector)
     ).strip()
     apple_script = f"""
@@ -1985,8 +2422,23 @@ on run argv
                 set clickResult to execute articleTab javascript clickScript
                 if clickResult is "request_blocked" then return "request_blocked"
                 if clickResult is "download_unavailable" then return "download_unavailable"
+                if clickResult starts with "not_found:" then return clickResult
                 if clickResult is "navigation_complete" then return "navigation_complete"
                 if clickResult is "proxy_navigation_started" then set proxyNavigationStarted to true
+                if clickResult is "trusted_download_ready" then
+                    activate
+                    delay 0.2
+                    tell application "System Events" to key code 36
+                    if proxyNavigationStarted then return "download_clicked_after_proxy"
+                    return "download_clicked"
+                end if
+                if clickResult is "trusted_pdf_button_ready" then
+                    activate
+                    delay 0.2
+                    tell application "System Events" to key code 36
+                    if proxyNavigationStarted then return "download_clicked_after_proxy"
+                    return "download_clicked"
+                end if
                 if clickResult starts with "navigate_epdf:" then
                     set epdfUrl to text 15 thru -1 of clickResult
                     set URL of articleTab to epdfUrl
@@ -2058,6 +2510,16 @@ end run
         )
 
     status = result.stdout.strip()
+    if status.startswith("not_found:"):
+        error_code = status.partition(":")[2] or "article_not_found"
+        print(
+            f"  [AUTO-PDF] detected permanent not-found page ({error_code})",
+            flush=True,
+        )
+        return PublisherOpenResult(
+            PublisherOpenStatus.NOT_FOUND,
+            detail=error_code,
+        )
     if status.startswith("http_error:"):
         try:
             http_status = int(status.partition(":")[2])
@@ -2174,12 +2636,32 @@ def open_url(url: str) -> PublisherOpenResult:
                 download_ready_selector=click_rule.download_ready_selector,
                 public_host=click_rule.public_host,
                 proxy_host=click_rule.proxy_host,
+                proxy_path_replacements=click_rule.proxy_path_replacements,
                 configured_click_timeout_seconds=(
                     click_rule.click_timeout_seconds
                 ),
             )
             if open_status.status is not PublisherOpenStatus.AUTOMATION_FAILED:
                 return open_status
+        elif sys.platform == "darwin" and shutil.which("osascript"):
+            publisher = publisher_name_for_url(url)
+            inspection_status = open_publisher_and_click_pdf(
+                url=url,
+                publisher=publisher,
+                selector='meta[name="__browser_pdf_no_click__"]',
+                download_selector=None,
+                reveal_download_selector=None,
+                direct_navigation=True,
+                configured_click_timeout_seconds=8,
+            )
+            if inspection_status.status is PublisherOpenStatus.AUTOMATION_FAILED:
+                # The AppleScript creates the tab before inspecting it. Do not
+                # open a duplicate merely because that tab disallows JavaScript.
+                return PublisherOpenResult(
+                    PublisherOpenStatus.OPENED,
+                    detail=inspection_status.detail,
+                )
+            return inspection_status
 
     webbrowser.open_new_tab(url)
     return PublisherOpenResult(PublisherOpenStatus.OPENED)
@@ -2321,6 +2803,31 @@ def build_queue(
         if require_target_flag and not is_yes(row.get(IS_FETCH_TARGET_COLUMN)):
             continue
 
+        if is_yes(row.get(SKIP_FUTURE_RUNS_COLUMN)):
+            print(
+                f"[PERSISTENT SKIP] pmid= "
+                f"{normalize_cell(row.get(PMID_COLUMN))} "
+                f"{SKIP_FUTURE_RUNS_COLUMN}=Y"
+            )
+            continue
+
+        previous_error_code = normalize_cell(
+            row.get(FETCH_ERROR_CODE_COLUMN)
+        ).casefold()
+        previous_retryable = normalize_cell(
+            row.get(FETCH_ERROR_RETRYABLE_COLUMN)
+        ).casefold()
+        if (
+            previous_error_code in TERMINAL_NOT_FOUND_ERROR_CODES
+            and previous_retryable != "y"
+        ):
+            print(
+                f"[TERMINAL SKIP] pmid= "
+                f"{normalize_cell(row.get(PMID_COLUMN))} "
+                f"error={previous_error_code}"
+            )
+            continue
+
         raw_pmid = normalize_cell(row.get(PMID_COLUMN))
         if not raw_pmid:
             continue
@@ -2433,8 +2940,15 @@ def build_queue(
         existing_url = normalize_cell(row.get(DOWNLOAD_URL_COLUMN))
         override_url = institutional_url_override(doi)
         rsc_url = rsc_proxy_article_url(doi)
+        aip_proxy_url = (
+            prepare_pdf_url_locally(doi)
+            if normalize_doi(doi).casefold().startswith("10.1063/")
+            else ""
+        )
         repaired_existing_url = (
-            rewrite_resolved_url(existing_url, fallback_doi=doi)
+            generic_osu_proxy_url(
+                rewrite_resolved_url(existing_url, fallback_doi=doi)
+            )
             if is_http_url(existing_url)
             else existing_url
         )
@@ -2444,6 +2958,8 @@ def build_queue(
             planned_action = "refresh existing URL"
         elif OVERRIDE_EXISTING_DOWNLOAD_URLS:
             planned_action = "resolve DOI"
+        elif is_doi_resolver_url(existing_url) and aip_proxy_url:
+            planned_action = "repair AIP DOI URL"
         elif is_doi_resolver_url(existing_url) and rsc_url:
             planned_action = "repair RSC DOI URL"
         elif repaired_existing_url != existing_url:
@@ -2463,7 +2979,9 @@ def build_queue(
                 print(f"  [OVERRIDE] doi={doi} -> {url}")
         elif OVERRIDE_EXISTING_DOWNLOAD_URLS:
             repaired_url = (
-                rewrite_resolved_url(existing_url, fallback_doi=doi)
+                generic_osu_proxy_url(
+                    rewrite_resolved_url(existing_url, fallback_doi=doi)
+                )
                 if is_http_url(existing_url)
                 else existing_url
             )
@@ -2481,6 +2999,10 @@ def build_queue(
                 )
                 if existing_url and url != existing_url:
                     print(f"  [REFRESH URL] {existing_url} -> {url}")
+        elif is_doi_resolver_url(existing_url) and aip_proxy_url:
+            url = aip_proxy_url
+            action = "repaired"
+            print(f"  [REPAIR URL] {existing_url} -> {url}")
         elif is_doi_resolver_url(existing_url) and rsc_url:
             url = rsc_url
             action = "repaired"
@@ -2560,6 +3082,13 @@ def main() -> int:
     if WAIT_TIMEOUT_SECONDS <= 0 or POLL_INTERVAL_SECONDS <= 0:
         print("Download timeout and polling interval must be positive")
         return 1
+    if (
+        IN_PROGRESS_DOWNLOAD_TIMEOUT_SECONDS <= 0
+        or IN_PROGRESS_DOWNLOAD_STALL_SECONDS <= 0
+        or DOWNLOAD_PROGRESS_REPORT_SECONDS <= 0
+    ):
+        print("In-progress download wait settings must be positive")
+        return 1
     if AUTO_CLEAR_BROWSER_CACHE and CACHE_CLEAR_EVERY_FILES <= 0:
         print("CACHE_CLEAR_EVERY_FILES must be > 0 when cache cleanup is enabled")
         return 1
@@ -2568,6 +3097,16 @@ def main() -> int:
         return 1
     if SCIENCEDIRECT_REQUEST_ERROR_MAX_RETRIES < 0:
         print("SCIENCEDIRECT_REQUEST_ERROR_MAX_RETRIES must be >= 0")
+        return 1
+    if (
+        OPTICA_DOWNLOADS_PER_BURST <= 0
+        or OPTICA_COOLDOWN_SECONDS < 0
+        or OPTICA_RATE_LIMIT_MAX_DEFERRALS < 0
+    ):
+        print(
+            "Optica burst size must be > 0; cooldown and max deferrals "
+            "must be >= 0"
+        )
         return 1
     if (
         DOI_RESOLUTION_MIN_INTERVAL_SECONDS < 0
@@ -2654,13 +3193,52 @@ def main() -> int:
     successful_cleanup_downloads_by_publisher: dict[str, int] = {}
     consecutive_publisher_failures: dict[str, tuple[str, int]] = {}
     open_publisher_circuits: dict[str, PublisherCircuit] = {}
+    publisher_cooldown_until: dict[str, float] = {}
+    publisher_success_counts: dict[str, int] = {}
+    rate_limit_deferrals: dict[int, int] = {}
 
-    for position, row in enumerate(queue, start=1):
+    position = 0
+    while position < len(queue):
+        row = queue[position]
+        position += 1
         pmid = normalize_pmid(row.get(PMID_COLUMN))
         url = normalize_cell(row.get(DOWNLOAD_URL_COLUMN))
         destination = OUTPUT_DIR / f"{pmid}.pdf"
 
-        print(f"\n[{position}/{len(queue)}] pmid= {pmid}")
+        print(
+            f"\n[{position}/{len(queue)}] pmid= {pmid} | "
+            f"doi= {normalize_cell(row.get(DOI_COLUMN))}"
+        )
+
+        provisional_publisher = publisher_name_for_url(url)
+        cooldown_until = publisher_cooldown_until.get(provisional_publisher, 0.0)
+        now_monotonic = time.monotonic()
+        if cooldown_until > now_monotonic:
+            remaining_seconds = cooldown_until - now_monotonic
+            queue.append(row)
+            print(
+                f"  [PUBLISHER DEFER] {provisional_publisher} cooling down for "
+                f"another {remaining_seconds:.0f}s; running other publishers first",
+                flush=True,
+            )
+            runnable_later = False
+            for candidate in queue[position:]:
+                candidate_url = normalize_cell(candidate.get(DOWNLOAD_URL_COLUMN))
+                candidate_publisher = publisher_name_for_url(candidate_url)
+                if (
+                    publisher_cooldown_until.get(candidate_publisher, 0.0)
+                    <= time.monotonic()
+                ):
+                    runnable_later = True
+                    break
+            if not runnable_later:
+                print(
+                    f"  [PUBLISHER WAIT] no other publisher is ready; waiting "
+                    f"{remaining_seconds:.0f}s for {provisional_publisher}",
+                    flush=True,
+                )
+                time.sleep(remaining_seconds)
+            continue
 
         if destination.exists() and is_pdf_file(destination):
             print(f"  [SKIP] already exists: {destination.name}")
@@ -2676,7 +3254,6 @@ def main() -> int:
                 write_csv_rows(OUTPUT_CSV, fieldnames, rows)
             continue
 
-        provisional_publisher = publisher_name_for_url(url)
         if (
             not DRY_RUN
             and is_doi_resolver_url(url)
@@ -2784,7 +3361,7 @@ def main() -> int:
             write_csv_rows(OUTPUT_CSV, fieldnames, rows)
             continue
 
-        known = snapshot_completed_files(WATCH_DIR)
+        known = snapshot_download_files(WATCH_DIR)
         started_at = now_timestamp()
         log_event(
             {
@@ -2798,6 +3375,7 @@ def main() -> int:
 
         request_error_failure = ""
         download_unavailable = False
+        rate_limit_deferred = False
         if not DRY_RUN:
             request_error_retries = 0
             while True:
@@ -2811,27 +3389,113 @@ def main() -> int:
                 if open_status.status is not PublisherOpenStatus.REQUEST_BLOCKED:
                     break
 
+                if publisher == "Optica Publishing Group":
+                    row_key = id(row)
+                    deferral_count = rate_limit_deferrals.get(row_key, 0)
+                    if deferral_count < OPTICA_RATE_LIMIT_MAX_DEFERRALS:
+                        deferral_count += 1
+                        rate_limit_deferrals[row_key] = deferral_count
+                        publisher_cooldown_until[publisher] = max(
+                            publisher_cooldown_until.get(publisher, 0.0),
+                            time.monotonic() + OPTICA_COOLDOWN_SECONDS,
+                        )
+                        queue.append(row)
+                        rate_limit_deferred = True
+                        print(
+                            f"  [RATE LIMIT DEFER] {publisher} paused for "
+                            f"{OPTICA_COOLDOWN_SECONDS}s; article requeued "
+                            f"behind other publishers "
+                            f"({deferral_count}/{OPTICA_RATE_LIMIT_MAX_DEFERRALS})",
+                            flush=True,
+                        )
+                        log_event(
+                            {
+                                "event": "publisher_rate_limit_deferred",
+                                "publisher": publisher,
+                                "pmid": pmid,
+                                "url": url,
+                                "cooldown_seconds": OPTICA_COOLDOWN_SECONDS,
+                                "deferral_count": deferral_count,
+                                "detected_at": now_timestamp(),
+                            }
+                        )
+                        close_completed_automatic_tab(url)
+                        break
+
                 if (
                     request_error_retries
                     >= SCIENCEDIRECT_REQUEST_ERROR_MAX_RETRIES
                 ):
                     request_error_failure = (
-                        "sciencedirect_request_error_retries_exhausted"
+                        "publisher_request_error_retries_exhausted"
                     )
                     break
 
                 request_error_retries += 1
-                if not recover_from_sciencedirect_request_error(
+                if not recover_from_publisher_request_error(
+                    publisher=publisher,
                     pmid=pmid,
                     url=url,
                     retry_number=request_error_retries,
                 ):
                     request_error_failure = (
-                        "sciencedirect_request_error_cleanup_failed"
+                        "publisher_request_error_recovery_failed"
                     )
                     break
 
+        if rate_limit_deferred:
+            continue
+
         if DRY_RUN:
+            continue
+
+        if open_status.status is PublisherOpenStatus.NOT_FOUND:
+            finished_at = now_timestamp()
+            error_code = (
+                open_status.detail
+                if open_status.detail in TERMINAL_NOT_FOUND_ERROR_CODES
+                else "article_not_found"
+            )
+            failure = FailureDetails(
+                category="not_found",
+                code=error_code,
+                detail=(
+                    "publisher page permanently reports that the article or "
+                    "DOI was not found"
+                ),
+                retryable=False,
+                recommended_action="verify or correct the DOI before retrying",
+            )
+            print(
+                f"  [TERMINAL NOT FOUND] recorded {error_code}; "
+                "this row will not open on later runs",
+                flush=True,
+            )
+            log_event(
+                {
+                    "event": "terminal_not_found",
+                    "pmid": pmid,
+                    "publisher": publisher,
+                    "url": url,
+                    "error": failure.__dict__,
+                    "started_at": started_at,
+                    "finished_at": finished_at,
+                }
+            )
+            write_result(
+                row,
+                status="failed",
+                source="publisher_not_found",
+                error=error_code,
+                started_at=started_at,
+                finished_at=finished_at,
+                url=url,
+                publisher=publisher,
+                failure=failure,
+            )
+            write_csv_rows(OUTPUT_CSV, fieldnames, rows)
+            if CLOSE_COMPLETED_AUTOMATIC_TABS:
+                close_completed_automatic_tab(url)
             continue
 
         if open_status.status is PublisherOpenStatus.HTTP_ERROR:
@@ -2957,7 +3621,7 @@ def main() -> int:
                     "consecutive request-blocked failures; later records will be skipped"
                 )
             print(
-                "  [FAILED] ScienceDirect request-error recovery stopped: "
+                f"  [FAILED] {publisher} request-error recovery stopped: "
                 f"{request_error_failure}",
                 flush=True,
             )
@@ -2990,21 +3654,50 @@ def main() -> int:
             continue
 
         while True:
-            skip_keys = "'s'" if os.name == "nt" else "'s' + Enter"
-            hint = f"| press {skip_keys} to skip" if INTERACTIVE_SKIP else ""
+            if os.name == "nt":
+                skip_hint = "'s' to skip once | 'p' to skip future runs"
+            else:
+                skip_hint = (
+                    "'s' + Enter to skip once | "
+                    "'p' + Enter to skip future runs"
+                )
+            hint = f"| press {skip_hint}" if INTERACTIVE_SKIP else ""
             print(f"  [WAIT] {WAIT_TIMEOUT_SECONDS}s {hint}".rstrip())
-            new_file, skipped = wait_for_download(known, expected_url=url)
+            new_file, skip_action = wait_for_download(known, expected_url=url)
 
-            if skipped:
+            if skip_action:
+                persistent_skip = skip_action == "p"
                 finished_at = now_timestamp()
+                error_code = (
+                    "manually_skipped_future"
+                    if persistent_skip
+                    else "manually_skipped"
+                )
                 failure = FailureDetails(
                     category="user_action",
-                    code="manually_skipped",
-                    detail="user skipped the record while waiting for a download",
-                    retryable=True,
-                    recommended_action="retry manually if the PDF is still needed",
+                    code=error_code,
+                    detail=(
+                        "user persistently skipped this record while waiting "
+                        "for a download"
+                        if persistent_skip
+                        else "user skipped the record for this run while waiting "
+                        "for a download"
+                    ),
+                    retryable=not persistent_skip,
+                    recommended_action=(
+                        f"set {SKIP_FUTURE_RUNS_COLUMN} to N or blank to retry"
+                        if persistent_skip
+                        else "retry on the next run if the PDF is still needed"
+                    ),
                 )
-                print("  [SKIP] manually skipped")
+                if persistent_skip:
+                    row[SKIP_FUTURE_RUNS_COLUMN] = "Y"
+                    print(
+                        f"  [PERSISTENT SKIP] recorded "
+                        f"{SKIP_FUTURE_RUNS_COLUMN}=Y"
+                    )
+                else:
+                    print("  [SKIP] skipped for this run")
                 reset_publisher_failures(publisher, consecutive_publisher_failures)
                 log_event(
                     {
@@ -3012,7 +3705,10 @@ def main() -> int:
                         "pmid": pmid,
                         "publisher": publisher,
                         "url": url,
-                        "reason": "manually_skipped",
+                        "reason": error_code,
+                        SKIP_FUTURE_RUNS_COLUMN: (
+                            "Y" if persistent_skip else ""
+                        ),
                         "error": failure.__dict__,
                         "started_at": started_at,
                         "finished_at": finished_at,
@@ -3021,7 +3717,8 @@ def main() -> int:
                 write_result(
                     row,
                     status="skipped",
-                    error="manually_skipped",
+                    source="user_persistent_skip" if persistent_skip else "browser",
+                    error=error_code,
                     started_at=started_at,
                     finished_at=finished_at,
                     url=url,
@@ -3074,6 +3771,34 @@ def main() -> int:
                 ):
                     close_completed_automatic_tab(url)
                 successful_downloads += 1
+                publisher_success_count = (
+                    publisher_success_counts.get(publisher, 0) + 1
+                )
+                publisher_success_counts[publisher] = publisher_success_count
+                if (
+                    publisher == "Optica Publishing Group"
+                    and publisher_success_count % OPTICA_DOWNLOADS_PER_BURST == 0
+                ):
+                    publisher_cooldown_until[publisher] = max(
+                        publisher_cooldown_until.get(publisher, 0.0),
+                        time.monotonic() + OPTICA_COOLDOWN_SECONDS,
+                    )
+                    print(
+                        f"  [SCHEDULED PUBLISHER PAUSE] {publisher} completed "
+                        f"{publisher_success_count} downloads; deferring it for "
+                        f"{OPTICA_COOLDOWN_SECONDS}s while other publishers run",
+                        flush=True,
+                    )
+                    log_event(
+                        {
+                            "event": "publisher_scheduled_cooldown",
+                            "publisher": publisher,
+                            "successful_downloads": publisher_success_count,
+                            "burst_size": OPTICA_DOWNLOADS_PER_BURST,
+                            "cooldown_seconds": OPTICA_COOLDOWN_SECONDS,
+                            "started_at": now_timestamp(),
+                        }
+                    )
                 if (
                     CLOSE_SCIENCEDIRECT_TABS_AT_BREAK
                     and download_break_is_due(successful_downloads)
