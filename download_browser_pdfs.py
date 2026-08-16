@@ -295,10 +295,10 @@ def write_csv_rows(path: Path, fieldnames: list[str], rows: list[dict[str, str]]
     os.replace(temp_path, path)
 
 
-INPUT_CSV = (PROJECT_ROOT / "target_records_ooc_round1_prescreen_passed.csv").resolve()
+INPUT_CSV = (PROJECT_ROOT / "target_records.csv").resolve()
 OUTPUT_CSV = INPUT_CSV
 WATCH_DIR = (Path.home() / "Downloads").resolve()
-OUTPUT_DIR = (PROJECT_ROOT / "browser_ooc_round1_prescreen_passed").resolve()
+OUTPUT_DIR = (PROJECT_ROOT / "browser").resolve()
 
 BATCH_START = 0
 BATCH_LIMIT = 3000
@@ -456,6 +456,10 @@ INSTITUTIONAL_URL_OVERRIDES = {
         "https://www-sciencedirect-com.proxy.lib.ohio-state.edu/"
         "science/article/pii/S0022534711035427"
     ),
+    "10.7150/thno.86921": (
+        "https://www.proquest.com/docview/2867161859/fulltextPDF"
+        "?pq-origsite=primo&sourcetype=Scholarly%20Journals"
+    ),
 }
 
 SCIENCEDIRECT_PROXY_HOST = "www-sciencedirect-com.proxy.lib.ohio-state.edu"
@@ -502,6 +506,14 @@ JCS_ARTICLE_LOOKUP_BASE_URL = (
 )
 JOVE_PUBLIC_HOST = "www.jove.com"
 JOVE_PROXY_HOST = "www-jove-com.proxy.lib.ohio-state.edu"
+RESEARCH_SQUARE_PUBLIC_HOST = "www.researchsquare.com"
+RESEARCH_SQUARE_PROXY_HOST = (
+    "www-researchsquare-com.proxy.lib.ohio-state.edu"
+)
+ESMED_PUBLIC_HOST = "esmed.org"
+ESMED_PROXY_HOST = "esmed-org.proxy.lib.ohio-state.edu"
+PROQUEST_PUBLIC_HOST = "www.proquest.com"
+PROQUEST_PROXY_HOST = "www-proquest-com.proxy.lib.ohio-state.edu"
 RSC_ARTICLE_CODE_PATTERN = re.compile(
     r"^(?P<decade>[a-d])(?P<year>\d)(?P<journal>[a-z]{2})[a-z0-9]+$",
     re.IGNORECASE,
@@ -581,7 +593,12 @@ LITERATUM_PLATFORM_PROFILE = PublisherPlatformProfile(
 OJS_PLATFORM_PROFILE = PublisherPlatformProfile(
     pdf_selector=(
         'a.galley-link.obj_galley_link.pdf[href*="/article/view/"], '
-        'a.obj_galley_link.pdf[href*="/article/view/"]'
+        'a.obj_galley_link.pdf[href*="/article/view/"], '
+        'a.galley-link[href*="/article/view/"]'
+    ),
+    download_selector=(
+        'a.download[download][href*="/article/download/"], '
+        'a[download][href*="/article/download/"]'
     ),
 )
 
@@ -628,6 +645,8 @@ DOI_REDIRECT_HOST_HINTS: list[tuple[str, str]] = [
     ("10.1113/", "physoc.onlinelibrary.wiley.com"),
     ("10.1242/", COMPANY_BIOLOGISTS_PUBLIC_HOST),
     ("10.3791/", JOVE_PUBLIC_HOST),
+    ("10.1101/", "www.medrxiv.org"),
+    ("10.21203/", RESEARCH_SQUARE_PUBLIC_HOST),
     ("10.64898/", "www.biorxiv.org"),
     ("10.34172/", "bi.tbzmed.ac.ir"),
     ("10.34133/", "spj.science.org"),
@@ -809,6 +828,11 @@ PUBLISHER_SITE_OVERRIDES = (
         publisher="Haematologica",
         platform="ojs",
         host_matches=public_domain_matcher("haematologica.org"),
+    ),
+    PublisherSiteDefinition(
+        publisher="European Society of Medicine",
+        platform="ojs",
+        host_matches=public_domain_matcher("esmed.org"),
     ),
     PublisherSiteDefinition(
         publisher="ASCO Publications",
@@ -1168,6 +1192,12 @@ def rewrite_resolved_url(url: str, fallback_doi: str = "") -> str:
     if host == FRONTIERS_PROXY_HOST:
         return parsed._replace(netloc=FRONTIERS_PUBLIC_HOST).geturl()
 
+    if host == RESEARCH_SQUARE_PROXY_HOST:
+        return parsed._replace(netloc=RESEARCH_SQUARE_PUBLIC_HOST).geturl()
+
+    if host == ESMED_PROXY_HOST:
+        return parsed._replace(netloc=ESMED_PUBLIC_HOST).geturl()
+
     if is_public_or_osu_proxy_host(host, JOVE_PUBLIC_HOST):
         article_id = ""
         if doi.casefold().startswith("10.3791/"):
@@ -1315,6 +1345,14 @@ def prepare_pdf_url_locally(doi: str) -> str:
         pdf_app_url = jove_pdf_app_url(article_id)
         if pdf_app_url:
             return pdf_app_url
+    research_square_prefix = "10.21203/rs.3."
+    if doi.casefold().startswith(research_square_prefix):
+        article_path = doi[len(research_square_prefix):].strip("/")
+        if article_path:
+            return (
+                f"https://{RESEARCH_SQUARE_PUBLIC_HOST}/article/"
+                f"{encoded_doi(article_path)}"
+            )
     if doi.casefold().startswith("10.1038/s"):
         return nature_article_url(doi)
     rsc_url = rsc_proxy_article_url(doi)
@@ -2310,9 +2348,12 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
                 'a[href$=".pdf"]:has(> button[aria-label="Download PDF"])'
             ),
         )
-    if is_public_or_osu_proxy_host(host, "www.biorxiv.org"):
+    if (
+        is_public_or_osu_proxy_host(host, "www.biorxiv.org")
+        or is_public_or_osu_proxy_host(host, "www.medrxiv.org")
+    ):
         return PublisherClickRule(
-            publisher="bioRxiv",
+            publisher="bioRxiv / medRxiv",
             pdf_selector=(
                 'a.article-dl-pdf-link[href*="/content/"]'
                 '[href$=".full.pdf"], '
@@ -2322,6 +2363,27 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
             request_error_text=(
                 "We have received a high number of requests from this session."
             ),
+        )
+    if is_public_or_osu_proxy_host(host, RESEARCH_SQUARE_PUBLIC_HOST):
+        return PublisherClickRule(
+            publisher="Research Square",
+            pdf_selector=(
+                'a[data-track="content_download"]'
+                '[data-track-context="article pdf"]'
+                '[href*="/article/"][href*=".pdf"], '
+                'a[href*="/article/"][href*=".pdf"]'
+            ),
+        )
+    if is_public_or_osu_proxy_host(host, PROQUEST_PUBLIC_HOST):
+        return PublisherClickRule(
+            publisher="ProQuest",
+            pdf_selector=(
+                'a.pdf-download[title="Download PDF"]'
+                '[href*="media.proquest.com"], '
+                'a[id^="downloadPDFLink_"][href*="media.proquest.com"]'
+            ),
+            public_host=PROQUEST_PUBLIC_HOST,
+            proxy_host=PROQUEST_PROXY_HOST,
         )
     if is_public_or_osu_proxy_host(host, "bi.tbzmed.ac.ir"):
         return PublisherClickRule(

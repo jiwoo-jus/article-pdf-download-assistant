@@ -26,9 +26,9 @@ constants before running a full metadata-to-download workflow.
 | Purpose | Current path |
 | --- | --- |
 | Metadata input/output | `target_records.csv` |
-| Downloader input/output | `target_records_ooc_round1_prescreen_passed.csv` |
+| Downloader input/output | `target_records.csv` |
 | Browser download watch directory | `~/Downloads` |
-| Final PDF directory | `browser_ooc_round1_prescreen_passed/` |
+| Final PDF directory | `browser/` |
 | Event log | `download_events.jsonl` |
 
 The relevant constants are `INPUT_CSV`, `OUTPUT_CSV`, `WATCH_DIR`, and
@@ -180,12 +180,19 @@ The local preparation layer includes these important repairs:
   `/content/pdf/` route.
 - Stale OSU-proxied MDPI and Frontiers direct-PDF URLs are converted to their
   current public PDF URLs.
+- Stale Research Square and European Society of Medicine proxy URLs are
+  converted to their working public article pages.
 - Liebert `10.1089/...` content uses the migrated SAGE/Literatum route.
 - JoVE `10.3791/...` records use JoVE's proxied `/pdf/{article_id}` application,
   which performs its authenticated PDF request; the raw
   `/api/article/pdf/{article_id}` endpoint is not used directly.
 - Recognized AIP, RSC, Wiley, ACS, PNAS, ASM, Taylor & Francis, IOP, Science,
   and other DOI families receive deterministic routes.
+- Research Square `10.21203/rs.3...` DOIs receive deterministic public article
+  routes, while `10.1101/...` DOI pages use the shared bioRxiv/medRxiv rule.
+- The Theranostics record `10.7150/thno.86921` uses its stable ProQuest document
+  page; the expiring session-specific `media.proquest.com` URL is discovered
+  from that page at run time.
 
 `OVERRIDE_EXISTING_DOWNLOAD_URLS = False` still allows recognized stale URLs to
 be repaired. Setting it to `True` rebuilds queued URLs from their DOI wherever
@@ -201,11 +208,13 @@ site-specific overrides:
   compatible sites. Site-specific selectors are added when necessary.
 - Literatum: shared reader/ePDF, PDF-download, and download-menu behavior used
   by Wiley, SAGE, Taylor & Francis, ASCO, NEJM, ACP, and compatible sites.
-- OJS: shared galley/PDF behavior used by registered OJS publishers.
+- OJS: shared galley plus viewer-download behavior used by registered OJS
+  publishers, including the European Society of Medicine site.
 
 Other publishers retain focused rules where their workflow is distinct,
 including ScienceDirect, Optica, IEEE Xplore, JoVE, Springer/Nature, RSC, PLOS,
-BMJ, Ovid, IOPscience, and others registered in the script.
+BMJ, Ovid, IOPscience, Research Square, ProQuest, bioRxiv/medRxiv, and others
+registered in the script.
 
 Recent special handling includes:
 
