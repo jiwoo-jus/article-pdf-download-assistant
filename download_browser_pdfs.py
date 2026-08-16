@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import os
@@ -16,8 +17,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from enum import Enum
+from functools import lru_cache
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Callable, Iterable, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, unquote, urlparse, urlsplit
 from urllib.request import Request, urlopen
@@ -88,6 +90,56 @@ class PublisherClickRule:
 
 
 @dataclass(frozen=True)
+class PublisherPlatformProfile:
+    pdf_selector: str
+    download_selector: str | None = None
+    reveal_download_selector: str | None = None
+    dismiss_selector: str | None = None
+    request_error_selector: str | None = None
+    request_error_text: str | None = None
+    download_unavailable_selector: str | None = None
+    download_unavailable_texts: tuple[str, ...] = ()
+    direct_navigation: bool = False
+    download_unavailable_statuses: tuple[int, ...] = ()
+    download_ready_selector: str | None = None
+
+
+@dataclass(frozen=True)
+class PublisherSiteDefinition:
+    publisher: str
+    platform: str
+    host_matches: Callable[[str], bool]
+    pdf_selector: str | None = None
+    download_selector: str | None = None
+    reveal_download_selector: str | None = None
+    dismiss_selector: str | None = None
+    request_error_selector: str | None = None
+    request_error_text: str | None = None
+    download_unavailable_selector: str | None = None
+    download_unavailable_texts: tuple[str, ...] = ()
+    direct_navigation: bool | None = None
+    download_unavailable_statuses: tuple[int, ...] = ()
+    download_ready_selector: str | None = None
+    public_host: str | None = None
+    proxy_host: str | None = None
+    proxy_path_replacements: tuple[tuple[str, str], ...] = ()
+    click_timeout_seconds: int | None = None
+
+
+@dataclass(frozen=True)
+class PublisherAutomationPolicy:
+    max_request_error_retries: int = 0
+    downloads_per_burst: int | None = None
+    cooldown_seconds: int = 0
+    max_rate_limit_deferrals: int = 0
+    clear_cache_on_request_error: bool = False
+    clear_cookies_on_request_error: bool = False
+    restart_browser_on_request_error: bool = False
+    close_tabs_on_request_error: bool = False
+    close_tabs_at_batch_break: bool = False
+
+
+@dataclass(frozen=True)
 class FileSnapshot:
     size: int
     modified_ns: int
@@ -98,6 +150,14 @@ class DownloadStrategy:
     priority: int
     automatic: bool
     label: str
+
+
+@dataclass(frozen=True)
+class PreparedDownloadUrl:
+    url: str
+    action: str
+    description: str
+    notice: str = ""
 
 
 class PublisherOpenStatus(Enum):
@@ -183,6 +243,22 @@ def encoded_doi(doi: str) -> str:
     return quote(doi, safe="/:()._-;")
 
 
+def nature_article_url(doi: str) -> str:
+    normalized = normalize_doi(doi)
+    prefix = "10.1038/"
+    if not normalized.casefold().startswith(prefix):
+        return ""
+    slug = normalized[len(prefix):].strip("/")
+    return f"https://{NATURE_PUBLIC_HOST}/articles/{encoded_doi(slug)}" if slug else ""
+
+
+def jove_pdf_app_url(article_id: str) -> str:
+    normalized_id = normalize_cell(article_id)
+    if not normalized_id.isascii() or not normalized_id.isdecimal():
+        return ""
+    return f"https://{JOVE_PROXY_HOST}/pdf/{normalized_id}"
+
+
 def is_yes(value: str | None) -> bool:
     return normalize_cell(value).upper() == TARGET_ENABLED_VALUE
 
@@ -219,10 +295,10 @@ def write_csv_rows(path: Path, fieldnames: list[str], rows: list[dict[str, str]]
     os.replace(temp_path, path)
 
 
-INPUT_CSV = (PROJECT_ROOT / "target_records.csv").resolve()
+INPUT_CSV = (PROJECT_ROOT / "target_records_ooc_round1_prescreen_passed.csv").resolve()
 OUTPUT_CSV = INPUT_CSV
 WATCH_DIR = (Path.home() / "Downloads").resolve()
-OUTPUT_DIR = (PROJECT_ROOT / "browser").resolve()
+OUTPUT_DIR = (PROJECT_ROOT / "browser_ooc_round1_prescreen_passed").resolve()
 
 BATCH_START = 0
 BATCH_LIMIT = 3000
@@ -250,11 +326,34 @@ OPEN_COMMAND: str | None = None
 # Append-only, machine-readable history for later failure-pattern analysis.
 BATCH_LOG_PATH: Path | None = PROJECT_ROOT / "download_events.jsonl"
 # Matching URLs are recorded as skipped instead of silently disappearing.
-BLOCKED_URL_PATTERNS = ["chndoi.org", "jstage.jst.go.jp", "asmedigitalcollection.asme.org", "10.1115", "profile.thieme.de", "thieme-connect.de", 
-                        "eurekaselect.com", "10.2174", "eurekaselect.com", "ieeexplore.ieee.org", "10.1089", "10.64898", "10.1126", "10.1016", 
-                        # "onlinelibrary-wiley-com", "pubs-acs-org", "10.1177", "link.springer.com", "karger.com", "10.1159", "ashpublications.org", 
-                        "ascopubs.org", "neurology.org", "auajournals.org", "10.1158", "ovid.com", "jamaoto", "jamaoncol", 
-                        "ersnet.org", "10.23736", "degruyterbrill.com", "dustri.com"]
+BLOCKED_URL_PATTERNS = [
+    "chndoi.org",
+    "jstage.jst.go.jp",
+    "asmedigitalcollection.asme.org",
+    "10.1115",
+    "profile.thieme.de",
+    "thieme-connect.de",
+    "eurekaselect.com",
+    # "10.2174",
+    # "ieeexplore.ieee.org",
+    # "10.1089",
+    # "10.64898",
+    # "10.1126",
+    # "10.1016",
+    # # "onlinelibrary-wiley-com", "pubs-acs-org", "10.1177",
+    # # "link.springer.com", "karger.com", "10.1159", "ashpublications.org",
+    # "ascopubs.org",
+    # "neurology.org",
+    # "auajournals.org",
+    # "10.1158",
+    # "ovid.com",
+    # "jamaoto",
+    # "jamaoncol",
+    # "ersnet.org",
+    # "10.23736",
+    # "degruyterbrill.com",
+    # "dustri.com",
+]
 # Matching URLs remain in the queue but run in the manual-review tier.
 MANUAL_URL_PATTERNS = [] #"link.springer.com"
 AUTOMATE_PUBLISHER_PDF_CLICK = True
@@ -415,6 +514,83 @@ RSC_DECADE_START_YEARS = {
 }
 
 TEMP_SUFFIXES = {".crdownload", ".part", ".download", ".tmp"}
+DIRECT_PDF_PATH_PATTERNS = (
+    "/article-pdf/",
+    "/content/pdf/",
+    "/doi/pdf/",
+    "/pdf/",
+    "/pdfft/",
+)
+
+MDPI_PUBLIC_HOST = "www.mdpi.com"
+MDPI_PROXY_HOST = "www-mdpi-com.proxy.lib.ohio-state.edu"
+FRONTIERS_PUBLIC_HOST = "www.frontiersin.org"
+FRONTIERS_PROXY_HOST = "www-frontiersin-org.proxy.lib.ohio-state.edu"
+NATURE_PUBLIC_HOST = "www.nature.com"
+NATURE_PROXY_HOST = "www-nature-com.proxy.lib.ohio-state.edu"
+
+
+def is_direct_pdf_path(path: str) -> bool:
+    normalized = path.casefold().rstrip("/")
+    return normalized.endswith(".pdf") or normalized.endswith("/pdf") or any(
+        pattern in normalized for pattern in DIRECT_PDF_PATH_PATTERNS
+    )
+
+
+def combine_selectors(*selectors: str | None) -> str:
+    """Combine reusable platform selectors with publisher-specific additions."""
+    combined: list[str] = []
+    seen: set[str] = set()
+    for selector_group in selectors:
+        for selector in (selector_group or "").split(","):
+            selector = selector.strip()
+            if selector and selector not in seen:
+                seen.add(selector)
+                combined.append(selector)
+    return ", ".join(combined)
+
+
+SILVERCHAIR_PLATFORM_PROFILE = PublisherPlatformProfile(
+    pdf_selector=(
+        'a.article-pdfLink[data-doctype="contentPdf"]'
+        '[href*="/article-pdf/"], '
+        'a.article-pdfLink[href*="/article-pdf/"], '
+        'a[data-doctype="contentPdf"][href*="/article-pdf/"]'
+    ),
+)
+
+LITERATUM_PLATFORM_PROFILE = PublisherPlatformProfile(
+    pdf_selector=(
+        'a[href*="/doi/epdf/"], '
+        'a[href*="/doi/reader/"]'
+    ),
+    download_selector=(
+        'a[data-download-files-key="pdf"][href*="/doi/pdf/"], '
+        'a[data-download-files-key="pdf"][href*="/doi/pdfdirect/"], '
+        'a[data-single-download="true"][href*="/doi/pdf/"], '
+        'a[data-single-download="true"][href*="/doi/pdfdirect/"], '
+        'a[aria-label^="Download PDF"][href*="/doi/pdf/"]'
+    ),
+    reveal_download_selector=(
+        'button[aria-label="Download"][aria-haspopup="true"], '
+        'button[aria-label="Download document"][aria-haspopup="true"], '
+        '.navbar-download button.dropdown-trigger[aria-haspopup="true"]'
+    ),
+)
+
+OJS_PLATFORM_PROFILE = PublisherPlatformProfile(
+    pdf_selector=(
+        'a.galley-link.obj_galley_link.pdf[href*="/article/view/"], '
+        'a.obj_galley_link.pdf[href*="/article/view/"]'
+    ),
+)
+
+PUBLISHER_PLATFORM_PROFILES = {
+    "silverchair": SILVERCHAIR_PLATFORM_PROFILE,
+    "literatum": LITERATUM_PLATFORM_PROFILE,
+    "ojs": OJS_PLATFORM_PROFILE,
+}
+
 TERMINAL_NOT_FOUND_ERROR_CODES = {
     "article_not_found",
     "doi_not_found",
@@ -554,6 +730,397 @@ def institutional_url_override(doi: str) -> str:
     return ""
 
 
+def public_domain_matcher(domain: str) -> Callable[[str], bool]:
+    return lambda host: is_public_or_osu_proxy_host(host, domain)
+
+
+PUBLISHER_SITE_OVERRIDES = (
+    PublisherSiteDefinition(
+        publisher="AIP Publishing",
+        platform="silverchair",
+        host_matches=public_domain_matcher(AIP_PUBLIC_HOST),
+        public_host=AIP_PUBLIC_HOST,
+        proxy_host=AIP_PROXY_HOST,
+    ),
+    PublisherSiteDefinition(
+        publisher="The Company of Biologists",
+        platform="silverchair",
+        host_matches=public_domain_matcher(COMPANY_BIOLOGISTS_PUBLIC_HOST),
+        public_host=COMPANY_BIOLOGISTS_PUBLIC_HOST,
+        proxy_host=COMPANY_BIOLOGISTS_PROXY_HOST,
+    ),
+    PublisherSiteDefinition(
+        publisher="ACS",
+        platform="silverchair",
+        host_matches=lambda host: host in ("pubs.acs.org", ACS_PROXY_HOST),
+        pdf_selector=(
+            'div.article-pdf-button-wrapper '
+            'a.article-pdfLink[href*="/article-pdf/"], '
+            'a.article-pdf-button[data-doctype="contentPdf"]'
+            '[href*="/article-pdf/"], '
+            'a[data-id="article_header_OpenPDF"][href*="/doi/pdf/"], '
+            'a.article__btn__secondary--pdf[href*="/doi/pdf/"]'
+        ),
+    ),
+    PublisherSiteDefinition(
+        publisher="RSC",
+        platform="silverchair",
+        host_matches=lambda host: (
+            host == RSC_PUBLIC_HOST
+            or host.endswith("-rsc-org.proxy.lib.ohio-state.edu")
+        ),
+        public_host=RSC_PUBLIC_HOST,
+        proxy_host=RSC_PROXY_HOST,
+        click_timeout_seconds=90,
+    ),
+    PublisherSiteDefinition(
+        publisher="Oxford Academic",
+        platform="silverchair",
+        host_matches=lambda host: (
+            host == "academic.oup.com"
+            or host.endswith("-oup-com.proxy.lib.ohio-state.edu")
+        ),
+        pdf_selector=(
+            'li.item-pdf a.article-pdfLink[href*="/advance-article-pdf/"], '
+            'a.article-pdfLink[href*="/advance-article-pdf/"]'
+        ),
+    ),
+    PublisherSiteDefinition(
+        publisher="AACR Journals",
+        platform="silverchair",
+        host_matches=public_domain_matcher("aacrjournals.org"),
+    ),
+    PublisherSiteDefinition(
+        publisher="JAMA Network",
+        platform="silverchair",
+        host_matches=public_domain_matcher("jamanetwork.com"),
+        pdf_selector=(
+            'a#pdf-link.js-pdfaccess[data-article-url$=".pdf"], '
+            'a.js-pdfaccess[aria-label="Download PDF"]'
+            '[data-article-url$=".pdf"]'
+        ),
+    ),
+    PublisherSiteDefinition(
+        publisher="ALTEX",
+        platform="ojs",
+        host_matches=public_domain_matcher("www.altex.org"),
+    ),
+    PublisherSiteDefinition(
+        publisher="Haematologica",
+        platform="ojs",
+        host_matches=public_domain_matcher("haematologica.org"),
+    ),
+    PublisherSiteDefinition(
+        publisher="ASCO Publications",
+        platform="literatum",
+        host_matches=public_domain_matcher("ascopubs.org"),
+        pdf_selector=(
+            'a.btn--pdf[href*="/doi/pdf/"], '
+            'a[aria-label*="PDF"][href*="/doi/pdf/"], '
+            'a[href*="/doi/pdf/"]'
+        ),
+        download_selector=(
+            'a.embedded--download--btn[href*="/doi/pdfdirect/"], '
+            'a[aria-label="Download PDF"][href*="/doi/pdfdirect/"], '
+            '#main-content a[href*="/doi/pdfdirect/"], '
+            'a[href*="/doi/pdfdirect/"]'
+        ),
+    ),
+    PublisherSiteDefinition(
+        publisher="NEJM",
+        platform="literatum",
+        host_matches=public_domain_matcher("www.nejm.org"),
+        pdf_selector=(
+            'a.btn--pdf[href*="/doi/pdf/"], '
+            'a[aria-label="View PDF"][href*="/doi/pdf/"], '
+            'a[href*="/doi/pdf/"]'
+        ),
+    ),
+    PublisherSiteDefinition(
+        publisher="Science Partner Journals",
+        platform="literatum",
+        host_matches=public_domain_matcher("spj.science.org"),
+        pdf_selector=(
+            'div.info-panel__formats a.btn[aria-label="PDF"]'
+            '[href*="/doi/reader/"], '
+            'a[aria-label="PDF"][href*="/doi/reader/"]'
+        ),
+        download_selector=(
+            'a.navbar-download[data-single-download="true"]'
+            '[data-download-files-key="pdf"][href*="/doi/pdf/"], '
+            'a[aria-label^="Download PDF"]'
+            '[href*="/doi/pdf/"][href*="download=true"]'
+        ),
+    ),
+    PublisherSiteDefinition(
+        publisher="Wiley",
+        platform="literatum",
+        host_matches=is_wiley_host,
+        pdf_selector=(
+            'a.pdf-download[href*="/doi/epdf/"], '
+            'a[title="ePDF"][href*="/doi/epdf/"]'
+        ),
+        download_selector=(
+            'a.download.drawerMenu--trigger[data-download-files-key="pdf"]'
+            '[data-single-download="true"][href*="/doi/pdfdirect/"], '
+            'a.navbar-download[href*="/doi/pdfdirect/"]'
+            '[data-single-download="true"], '
+            'a.navbar-download[href*="/doi/pdfdirect/"], '
+            'div.navbar-download a.download[data-download-files-key="pdf"]'
+            '[href*="/doi/pdfdirect/"], '
+            'a.download[data-download-files-key="pdf"]'
+            '[href*="/doi/pdfdirect/"]'
+        ),
+        reveal_download_selector=(
+            'button.dropdown-trigger[aria-label="Download document"]'
+            '[aria-haspopup="true"], '
+            '.navbar-download button.dropdown-trigger[aria-haspopup="true"]'
+        ),
+        download_unavailable_selector=(
+            '.popup_container.backgroundNotice .text-container .text, '
+            '.navbar-download .dropdown-content .dropdown-text'
+        ),
+        download_unavailable_texts=(
+            "Downloading and printing are disabled",
+            "You do not have permission to download",
+        ),
+        # The Wiley ePDF toolbar can render late through the institutional
+        # proxy. Successful clicks still return immediately.
+        click_timeout_seconds=60,
+    ),
+    PublisherSiteDefinition(
+        publisher="SAGE",
+        platform="literatum",
+        host_matches=is_sage_host,
+        pdf_selector=(
+            'a[data-id="article-toolbar-pdf-epub"][href*="/doi/reader/"]'
+        ),
+        download_selector=(
+            'a.navbar-download.format-download-btn'
+            '[data-download-files-key="pdf"][href*="/doi/pdf/"], '
+            'a.navbar-download[data-single-download="true"]'
+            '[href*="/doi/pdf/"], '
+            'a#favourite-download[href*="/doi/pdf/"]'
+        ),
+    ),
+    PublisherSiteDefinition(
+        publisher="PNAS",
+        platform="literatum",
+        host_matches=lambda host: (
+            host == "pnas.org"
+            or is_public_or_osu_proxy_host(host, "www.pnas.org")
+        ),
+        pdf_selector=(
+            'a.download[data-single-download="true"]'
+            '[data-download-files-key="pdf"]'
+            '[href*="/doi/pdf/"][href*="download=true"]'
+        ),
+        download_selector=(
+            'a.download[data-single-download="true"]'
+            '[data-download-files-key="pdf"]'
+            '[href*="/doi/pdf/"][href*="download=true"]'
+        ),
+    ),
+    PublisherSiteDefinition(
+        publisher="ASM Journals",
+        platform="literatum",
+        host_matches=public_domain_matcher(ASM_PUBLIC_HOST),
+        pdf_selector=(
+            'a.download[data-single-download="true"]'
+            '[data-download-files-key="pdf"]'
+            '[href*="/doi/pdf/"][href*="download=true"]'
+        ),
+        download_selector=(
+            'a.download[data-single-download="true"]'
+            '[data-download-files-key="pdf"]'
+            '[href*="/doi/pdf/"][href*="download=true"]'
+        ),
+    ),
+    PublisherSiteDefinition(
+        publisher="Taylor & Francis",
+        platform="literatum",
+        host_matches=is_tandfonline_host,
+        pdf_selector=(
+            'a.show-pdf[href*="/doi/epdf/"], '
+            'a[role="button"][href*="/doi/epdf/"]'
+        ),
+        download_selector=(
+            'a.download[data-download-files-key="pdf"][href*="/doi/pdf/"]'
+        ),
+        reveal_download_selector=(
+            'button#new-download-btn[aria-label="Download"]'
+        ),
+    ),
+    PublisherSiteDefinition(
+        publisher="ACP Journals",
+        platform="literatum",
+        host_matches=public_domain_matcher("acpjournals.org"),
+        pdf_selector=(
+            'div.info-panel__formats a.btn--pdf[href*="/doi/reader/"], '
+            'a.btn--pdf[aria-label="Open full-text in eReader"]'
+            '[href*="/doi/reader/"]'
+        ),
+        download_selector=(
+            'a.navbar-download[data-single-download="true"]'
+            '[data-download-files-key="pdf"][href*="/doi/pdf/"], '
+            'a[aria-label^="Download PDF"]'
+            '[href*="/doi/pdf/"][href*="download=true"]'
+        ),
+    ),
+    PublisherSiteDefinition(
+        publisher="AUA Journals",
+        platform="literatum",
+        host_matches=public_domain_matcher("auajournals.org"),
+        pdf_selector=(
+            'a.main-link[aria-label="PDF"][href*="/doi/epdf/"], '
+            'a[aria-label="PDF"][href*="/doi/epdf/"]'
+        ),
+    ),
+)
+
+# Silverchair's customer directory includes both content sites and corporate
+# homepages. Register the supplied domains as platform candidates while
+# keeping known publisher-specific and non-Silverchair content routes above.
+SILVERCHAIR_CUSTOMER_SITES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Allen Press", ("meridian.allenpress.com",)),
+    ("American Academy of Orthopaedic Surgeons", ("aaos.org",)),
+    (
+        "American Academy of Otolaryngology–Head and Neck Surgery Foundation",
+        ("entnet.org",),
+    ),
+    ("American Academy of Pediatrics", ("publications.aap.org",)),
+    ("American Accounting Association", ("aaahq.org",)),
+    ("American Association of Critical-Care Nurses", ("aacnjournals.org",)),
+    ("American Association of Immunologists", ("aai.org",)),
+    ("American Board of Surgery", ("surgicalcore.org",)),
+    (
+        "American Diabetes Association",
+        ("diabetes.org", "diabetesjournals.org"),
+    ),
+    (
+        "American Occupational Therapy Association",
+        ("aota.org", "research.aota.org"),
+    ),
+    ("American Registry of Pathology Press", ("arppress.org",)),
+    ("American Society of Anesthesiologists", ("pubs.asahq.org",)),
+    ("American Society of Hematology", ("ashpublications.org",)),
+    (
+        "American Society of Mechanical Engineers",
+        ("asmedigitalcollection.asme.org",),
+    ),
+    ("ASM International", ("dl.asminternational.org",)),
+    ("ASTM International", ("astm.org",)),
+    (
+        "Association for Materials Protection and Performance",
+        ("ampp.org", "content.ampp.org"),
+    ),
+    (
+        "Association for Research in Vision and Ophthalmology",
+        ("arvojournals.org",),
+    ),
+    ("Association of periOperative Registered Nurses", ("aornguidelines.org",)),
+    ("Bioscientifica", ("bioscientifica.com",)),
+    ("The Company of Biologists", ("biologists.com",)),
+    ("CSIRO Publishing", ("publish.csiro.au",)),
+    ("Duke University Press", ("read.dukeupress.edu",)),
+    (
+        "Emerald Publishing",
+        ("emeraldgrouppublishing.com", "emerald.com"),
+    ),
+    ("GeoScienceWorld", ("geoscienceworld.org",)),
+    ("IFIS", ("ifis.org",)),
+    ("IWA Publishing", ("iwaponline.com",)),
+    ("Karger Publishers", ("karger.com",)),
+    ("McGraw-Hill Medical", ("mhmedical.com",)),
+    ("MIS Quarterly", ("misq.umn.edu",)),
+    ("The MIT Press", ("direct.mit.edu",)),
+    ("Modern Language Association", ("mlahandbookplus.org",)),
+    ("Portland Press / Biochemical Society", ("portlandpress.com",)),
+    ("Rockefeller University Press", ("rupress.org",)),
+    (
+        "The Royal Society Publishing",
+        ("royalsociety.org", "royalsocietypublishing.org"),
+    ),
+    ("Royal Society of Chemistry Books", ("books.rsc.org",)),
+    ("Society of Petroleum Engineers", ("spe.org",)),
+    ("University of California Press", ("online.ucpress.edu",)),
+    ("Wolters Kluwer Health", ("lwwhealthlibrary.com",)),
+)
+
+
+def silverchair_customer_site_definition(
+    publisher: str,
+    domains: tuple[str, ...],
+) -> PublisherSiteDefinition:
+    return PublisherSiteDefinition(
+        publisher=publisher,
+        platform="silverchair",
+        host_matches=lambda host: any(
+            is_public_or_osu_proxy_host(host, domain) for domain in domains
+        ),
+    )
+
+
+PUBLISHER_SITE_DEFINITIONS = PUBLISHER_SITE_OVERRIDES + tuple(
+    silverchair_customer_site_definition(publisher, domains)
+    for publisher, domains in SILVERCHAIR_CUSTOMER_SITES
+)
+
+
+def publisher_rule_from_site(
+    site: PublisherSiteDefinition,
+) -> PublisherClickRule:
+    profile = PUBLISHER_PLATFORM_PROFILES[site.platform]
+    return PublisherClickRule(
+        publisher=site.publisher,
+        pdf_selector=combine_selectors(site.pdf_selector, profile.pdf_selector),
+        download_selector=combine_selectors(
+            site.download_selector,
+            profile.download_selector,
+        ) or None,
+        reveal_download_selector=combine_selectors(
+            site.reveal_download_selector,
+            profile.reveal_download_selector,
+        ) or None,
+        dismiss_selector=site.dismiss_selector or profile.dismiss_selector,
+        request_error_selector=(
+            site.request_error_selector or profile.request_error_selector
+        ),
+        request_error_text=site.request_error_text or profile.request_error_text,
+        download_unavailable_selector=(
+            site.download_unavailable_selector
+            or profile.download_unavailable_selector
+        ),
+        download_unavailable_texts=(
+            site.download_unavailable_texts
+            or profile.download_unavailable_texts
+        ),
+        direct_navigation=(
+            profile.direct_navigation
+            if site.direct_navigation is None
+            else site.direct_navigation
+        ),
+        download_unavailable_statuses=(
+            site.download_unavailable_statuses
+            or profile.download_unavailable_statuses
+        ),
+        download_ready_selector=(
+            site.download_ready_selector or profile.download_ready_selector
+        ),
+        public_host=site.public_host,
+        proxy_host=site.proxy_host,
+        proxy_path_replacements=site.proxy_path_replacements,
+        click_timeout_seconds=site.click_timeout_seconds,
+    )
+
+
+def publisher_site_rule_for_host(host: str) -> PublisherClickRule | None:
+    for site in PUBLISHER_SITE_DEFINITIONS:
+        if site.host_matches(host):
+            return publisher_rule_from_site(site)
+    return None
+
+
 def rsc_proxy_article_url(doi: str) -> str:
     """Build RSC's stable article-landing route from a standard article DOI."""
     normalized = normalize_doi(doi)
@@ -594,6 +1161,28 @@ def rewrite_resolved_url(url: str, fallback_doi: str = "") -> str:
     # on the correct host. In that case the original DOI remains authoritative.
     doi = doi_from_doi_path(path) or normalize_doi(fallback_doi)
     quoted_doi = encoded_doi(doi)
+
+    if host == MDPI_PROXY_HOST:
+        return parsed._replace(netloc=MDPI_PUBLIC_HOST).geturl()
+
+    if host == FRONTIERS_PROXY_HOST:
+        return parsed._replace(netloc=FRONTIERS_PUBLIC_HOST).geturl()
+
+    if is_public_or_osu_proxy_host(host, JOVE_PUBLIC_HOST):
+        article_id = ""
+        if doi.casefold().startswith("10.3791/"):
+            article_id = doi.split("/", 1)[1].strip()
+        else:
+            match = re.search(r"/(?:t|pdf)/(\d+)(?:/|$)", path)
+            article_id = match.group(1) if match else ""
+        pdf_app_url = jove_pdf_app_url(article_id)
+        if pdf_app_url:
+            return pdf_app_url
+
+    if host.endswith("link.springer.com") and doi.casefold().startswith("10.1038/s"):
+        nature_url = nature_article_url(doi)
+        if nature_url:
+            return nature_url
 
     if is_wiley_host(host) and doi:
         return f"{wiley_article_base_url(host)}/{quoted_doi}"
@@ -723,8 +1312,11 @@ def prepare_pdf_url_locally(doi: str) -> str:
         return f"https://elifesciences.org/articles/{article_id}.pdf"
     if doi.casefold().startswith("10.3791/"):
         article_id = doi.split("/", 1)[1].strip()
-        if article_id:
-            return f"https://{JOVE_PROXY_HOST}/t/{quote(article_id, safe='')}"
+        pdf_app_url = jove_pdf_app_url(article_id)
+        if pdf_app_url:
+            return pdf_app_url
+    if doi.casefold().startswith("10.1038/s"):
+        return nature_article_url(doi)
     rsc_url = rsc_proxy_article_url(doi)
     if rsc_url:
         return rsc_url
@@ -1500,51 +2092,45 @@ def maybe_clear_browser_cache(
     return cleared
 
 
-def recover_from_sciencedirect_request_error(
-    *,
-    pmid: str,
-    url: str,
-    retry_number: int,
-) -> bool:
-    """Reset Chrome after ScienceDirect rejects a request, ready for a retry."""
-    print(
-        "\n============================================================\n"
-        "[SCIENCEDIRECT REQUEST ERROR]\n"
-        "Closing ScienceDirect tabs, clearing Chrome cache and cookies, "
-        "and restarting Chrome.\n"
-        f"The current article will be retried ({retry_number}/"
-        f"{SCIENCEDIRECT_REQUEST_ERROR_MAX_RETRIES}).\n"
-        "============================================================",
-        flush=True,
-    )
-    log_event(
-        {
-            "event": "sciencedirect_request_error_recovery",
-            "pmid": pmid,
-            "url": url,
-            "retry_number": retry_number,
-            "started_at": now_timestamp(),
-        }
-    )
-
-    close_sciencedirect_tabs()
-    cleared = clear_browser_cache(clear_cookies=True, restart_chrome=True)
-    if not cleared:
-        print(
-            "  [RECOVERY FAILED] Chrome cleanup/restart did not fully complete.",
-            flush=True,
+def publisher_automation_policy(publisher: str) -> PublisherAutomationPolicy:
+    """Return operational behavior separately from publisher DOM selectors."""
+    common = {
+        "max_request_error_retries": SCIENCEDIRECT_REQUEST_ERROR_MAX_RETRIES,
+    }
+    if publisher == "ScienceDirect":
+        return PublisherAutomationPolicy(
+            **common,
+            clear_cache_on_request_error=True,
+            clear_cookies_on_request_error=True,
+            restart_browser_on_request_error=True,
+            close_tabs_on_request_error=True,
+            close_tabs_at_batch_break=CLOSE_SCIENCEDIRECT_TABS_AT_BREAK,
         )
-        return False
-
-    if DOWNLOAD_BREAK_SECONDS > 0:
-        print(
-            f"  [RECOVERY WAIT] Waiting {DOWNLOAD_BREAK_SECONDS}s before "
-            "retrying the same article.",
-            flush=True,
+    if publisher == "Optica Publishing Group":
+        return PublisherAutomationPolicy(
+            **common,
+            downloads_per_burst=OPTICA_DOWNLOADS_PER_BURST,
+            cooldown_seconds=OPTICA_COOLDOWN_SECONDS,
+            max_rate_limit_deferrals=OPTICA_RATE_LIMIT_MAX_DEFERRALS,
         )
-        time.sleep(DOWNLOAD_BREAK_SECONDS)
-    print("  [RECOVERY RETRY] Reopening the same ScienceDirect article.", flush=True)
-    return True
+    return PublisherAutomationPolicy(**common)
+
+
+def close_publisher_tabs(publisher: str, url: str) -> int:
+    """Close known publisher tabs, falling back to the current automatic tab."""
+    if publisher == "ScienceDirect":
+        return close_sciencedirect_tabs()
+    return int(close_completed_automatic_tab(url))
+
+
+def close_tabs_for_scheduled_break(url: str) -> int:
+    """Run tab cleanup for every publisher that opts into batch breaks."""
+    publishers = ("ScienceDirect", "Optica Publishing Group")
+    return sum(
+        close_publisher_tabs(publisher, url)
+        for publisher in publishers
+        if publisher_automation_policy(publisher).close_tabs_at_batch_break
+    )
 
 
 def recover_from_publisher_request_error(
@@ -1553,27 +2139,43 @@ def recover_from_publisher_request_error(
     pmid: str,
     url: str,
     retry_number: int,
+    policy: PublisherAutomationPolicy,
 ) -> bool:
-    """Pause and retry a publisher block without applying unsafe global cleanup."""
-    if publisher == "ScienceDirect":
-        return recover_from_sciencedirect_request_error(
-            pmid=pmid,
-            url=url,
-            retry_number=retry_number,
+    """Apply the configured recovery policy after an explicit request block."""
+    resets_browser = policy.clear_cache_on_request_error
+    heading = (
+        f"[{publisher.upper()} REQUEST ERROR]"
+        if resets_browser
+        else f"[{publisher.upper()} REQUEST LIMIT]"
+    )
+    recovery_description = (
+        f"Closing {publisher} tabs, clearing Chrome cache"
+        + (" and cookies" if policy.clear_cookies_on_request_error else "")
+        + (
+            ", and restarting Chrome."
+            if policy.restart_browser_on_request_error
+            else "."
         )
+        if resets_browser
+        else "The publisher reported too many requests for this browser session."
+    )
 
     print(
         "\n============================================================\n"
-        f"[{publisher.upper()} REQUEST LIMIT]\n"
-        "The publisher reported too many requests for this browser session.\n"
+        f"{heading}\n"
+        f"{recovery_description}\n"
         f"The current article will be retried ({retry_number}/"
-        f"{SCIENCEDIRECT_REQUEST_ERROR_MAX_RETRIES}).\n"
+        f"{policy.max_request_error_retries}).\n"
         "============================================================",
         flush=True,
     )
     log_event(
         {
-            "event": "publisher_request_error_recovery",
+            "event": (
+                "sciencedirect_request_error_recovery"
+                if publisher == "ScienceDirect"
+                else "publisher_request_error_recovery"
+            ),
             "publisher": publisher,
             "pmid": pmid,
             "url": url,
@@ -1581,7 +2183,24 @@ def recover_from_publisher_request_error(
             "started_at": now_timestamp(),
         }
     )
-    close_completed_automatic_tab(url)
+
+    if policy.close_tabs_on_request_error:
+        close_publisher_tabs(publisher, url)
+    else:
+        close_completed_automatic_tab(url)
+
+    if resets_browser:
+        cleared = clear_browser_cache(
+            clear_cookies=policy.clear_cookies_on_request_error,
+            restart_chrome=policy.restart_browser_on_request_error,
+        )
+        if not cleared:
+            print(
+                "  [RECOVERY FAILED] Chrome cleanup/restart did not fully complete.",
+                flush=True,
+            )
+            return False
+
     if DOWNLOAD_BREAK_SECONDS > 0:
         print(
             f"  [RECOVERY WAIT] Waiting {DOWNLOAD_BREAK_SECONDS}s before "
@@ -1593,12 +2212,18 @@ def recover_from_publisher_request_error(
     return True
 
 
+@lru_cache(maxsize=1024)
 def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
-    host = (urlparse(url).hostname or "").casefold()
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").casefold()
+    path = parsed.path
     if is_doi_resolver_url(url):
         hinted_host = publisher_host_hint_for_doi(url)
         if hinted_host:
             return publisher_pdf_click_rule(f"https://{hinted_host}/")
+    shared_platform_rule = publisher_site_rule_for_host(host)
+    if shared_platform_rule is not None:
+        return shared_platform_rule
     if is_public_or_osu_proxy_host(host, "link.springer.com"):
         return PublisherClickRule(
             publisher="Springer Nature",
@@ -1619,33 +2244,15 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
             direct_navigation=True,
             download_unavailable_statuses=(404,),
         )
-    if is_public_or_osu_proxy_host(host, AIP_PUBLIC_HOST):
-        return PublisherClickRule(
-            publisher="AIP Publishing",
-            pdf_selector=(
-                'li.toolbar-item.item-pdf '
-                'a.article-pdfLink[data-doctype="contentPdf"]'
-                '[href*="/article-pdf/"], '
-                'a.article-pdfLink[data-doctype="contentPdf"]'
-                '[href*="/article-pdf/"]'
-            ),
-            public_host=AIP_PUBLIC_HOST,
-            proxy_host=AIP_PROXY_HOST,
-        )
-    if is_public_or_osu_proxy_host(host, COMPANY_BIOLOGISTS_PUBLIC_HOST):
-        return PublisherClickRule(
-            publisher="The Company of Biologists",
-            pdf_selector=(
-                'li.toolbar-item.item-pdf '
-                'a.article-pdfLink[data-doctype="contentPdf"]'
-                '[href*="/article-pdf/"], '
-                'a.article-pdfLink[data-doctype="contentPdf"]'
-                '[href*="/article-pdf/"]'
-            ),
-            public_host=COMPANY_BIOLOGISTS_PUBLIC_HOST,
-            proxy_host=COMPANY_BIOLOGISTS_PROXY_HOST,
-        )
     if is_public_or_osu_proxy_host(host, JOVE_PUBLIC_HOST):
+        if path.startswith("/pdf/"):
+            return PublisherClickRule(
+                publisher="JoVE",
+                pdf_selector='meta[name="__jove_pdf_app__"]',
+                direct_navigation=True,
+                download_ready_selector="iframe#pdfIframe",
+                click_timeout_seconds=60,
+            )
         return PublisherClickRule(
             publisher="JoVE",
             pdf_selector=(
@@ -1676,15 +2283,6 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
             proxy_host=OPTICA_PROXY_HOST,
             proxy_path_replacements=(("/abstract.cfm", "/fulltext.cfm"),),
         )
-    if is_public_or_osu_proxy_host(host, "www.altex.org"):
-        return PublisherClickRule(
-            publisher="ALTEX",
-            pdf_selector=(
-                'ul.galleys_links a.obj_galley_link.pdf'
-                '[href*="/article/view/"], '
-                'a.obj_galley_link.pdf[href*="/article/view/"]'
-            ),
-        )
     if host.endswith("sciencedirect.com") or host == SCIENCEDIRECT_PROXY_HOST:
         return PublisherClickRule(
             publisher="ScienceDirect",
@@ -1704,66 +2302,12 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
                 "There was a problem providing the content you requested"
             ),
         )
-    if host in ("pubs.acs.org", ACS_PROXY_HOST):
-        return PublisherClickRule(
-            publisher="ACS",
-            pdf_selector=(
-                'div.article-pdf-button-wrapper '
-                'a.article-pdfLink[href*="/article-pdf/"], '
-                'a.article-pdf-button[data-doctype="contentPdf"]'
-                '[href*="/article-pdf/"], '
-                'a.article-pdfLink[data-doctype="contentPdf"]'
-                '[href*="/article-pdf/"], '
-                'a[data-id="article_header_OpenPDF"][href*="/doi/pdf/"], '
-                'a.article__btn__secondary--pdf[href*="/doi/pdf/"]'
-            ),
-        )
     if is_public_or_osu_proxy_host(host, "journalofethics.ama-assn.org"):
         return PublisherClickRule(
             publisher="AMA Journal of Ethics",
             pdf_selector=(
                 'a[href*="/sites/joedb/files/"][href$=".pdf"], '
                 'a[href$=".pdf"]:has(> button[aria-label="Download PDF"])'
-            ),
-        )
-    if is_public_or_osu_proxy_host(host, "ascopubs.org"):
-        return PublisherClickRule(
-            publisher="ASCO Publications",
-            pdf_selector=(
-                'a.btn--pdf[href*="/doi/pdf/"], '
-                'a[aria-label*="PDF"][href*="/doi/pdf/"], '
-                'a[href*="/doi/pdf/"]'
-            ),
-            download_selector=(
-                'a.embedded--download--btn[href*="/doi/pdfdirect/"], '
-                'a[aria-label="Download PDF"][href*="/doi/pdfdirect/"], '
-                '#main-content a[href*="/doi/pdfdirect/"], '
-                'a[href*="/doi/pdfdirect/"]'
-            ),
-        )
-    if is_public_or_osu_proxy_host(host, "www.nejm.org"):
-        return PublisherClickRule(
-            publisher="NEJM",
-            pdf_selector=(
-                'a.btn--pdf[href*="/doi/pdf/"], '
-                'a[aria-label="View PDF"][href*="/doi/pdf/"], '
-                'a[href*="/doi/pdf/"]'
-            ),
-        )
-    if is_public_or_osu_proxy_host(host, "spj.science.org"):
-        return PublisherClickRule(
-            publisher="Science Partner Journals",
-            pdf_selector=(
-                'div.info-panel__formats a.btn[aria-label="PDF"]'
-                '[href*="/doi/reader/"], '
-                'a[aria-label="PDF"][href*="/doi/reader/"]'
-            ),
-            download_selector=(
-                'a.navbar-download[data-single-download="true"]'
-                '[data-download-files-key="pdf"][href*="/doi/pdf/"], '
-                'a[aria-label^="Download PDF"]'
-                '[href*="/doi/pdf/"][href*="download=true"], '
-                'a[data-download-files-key="pdf"][href*="/doi/pdf/"]'
             ),
         )
     if is_public_or_osu_proxy_host(host, "www.biorxiv.org"):
@@ -1801,6 +2345,9 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
                 ':not([title*="do not have access"])'
             ),
             download_selector=(
+                'iframe[src*=".pdf"], '
+                '#main-content a[href*=".pdf"][href*="arnumber="]'
+                ':has(> button#open-button), '
                 'a[href*="/stampPDF/getPDF.jsp?"]'
                 '[href*="arnumber="][target="_blank"], '
                 'a[href*="/stampPDF/getPDF.jsp?"]'
@@ -1815,121 +2362,6 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
             ),
             public_host=IEEE_PUBLIC_HOST,
             proxy_host=IEEE_PROXY_HOST,
-        )
-    if is_wiley_host(host):
-        return PublisherClickRule(
-            publisher="Wiley",
-            pdf_selector=(
-                'a.pdf-download[href*="/doi/epdf/"], '
-                'a[title="ePDF"][href*="/doi/epdf/"]'
-            ),
-            download_selector=(
-                'a.navbar-download[href*="/doi/pdfdirect/"]'
-                '[data-single-download="true"], '
-                'a.navbar-download[href*="/doi/pdfdirect/"], '
-                'div.navbar-download a.download[data-download-files-key="pdf"]'
-                '[href*="/doi/pdfdirect/"], '
-                'a.download[data-download-files-key="pdf"]'
-                '[href*="/doi/pdfdirect/"]'
-            ),
-            reveal_download_selector=(
-                'button.dropdown-trigger[aria-label="Download document"]'
-                '[aria-haspopup="true"], '
-                '.navbar-download button.dropdown-trigger[aria-haspopup="true"]'
-            ),
-            download_unavailable_selector=(
-                '.popup_container.backgroundNotice .text-container .text, '
-                '.navbar-download .dropdown-content .dropdown-text'
-            ),
-            download_unavailable_texts=(
-                "Downloading and printing are disabled",
-                "You do not have permission to download",
-            ),
-        )
-    if is_sage_host(host):
-        return PublisherClickRule(
-            publisher="SAGE",
-            pdf_selector=(
-                'a[data-id="article-toolbar-pdf-epub"][href*="/doi/reader/"], '
-                'a[href*="/doi/reader/"]'
-            ),
-            download_selector=(
-                'a.navbar-download.format-download-btn'
-                '[data-download-files-key="pdf"][href*="/doi/pdf/"], '
-                'a.navbar-download[data-single-download="true"]'
-                '[href*="/doi/pdf/"], '
-                'a[data-download-files-key="pdf"][href*="/doi/pdf/"], '
-                'a#favourite-download[href*="/doi/pdf/"], '
-                'a[aria-label^="Download PDF"][href*="/doi/pdf/"]'
-            ),
-        )
-    if host == "pnas.org" or is_public_or_osu_proxy_host(host, "www.pnas.org"):
-        reader_download_selector = (
-            'a.download[data-single-download="true"]'
-            '[data-download-files-key="pdf"]'
-            '[href*="/doi/pdf/"][href*="download=true"]'
-        )
-        return PublisherClickRule(
-            publisher="PNAS",
-            pdf_selector=reader_download_selector,
-            download_selector=reader_download_selector,
-        )
-    if is_public_or_osu_proxy_host(host, ASM_PUBLIC_HOST):
-        reader_download_selector = (
-            'a.download[data-single-download="true"]'
-            '[data-download-files-key="pdf"]'
-            '[href*="/doi/pdf/"][href*="download=true"]'
-        )
-        return PublisherClickRule(
-            publisher="ASM Journals",
-            pdf_selector=reader_download_selector,
-            download_selector=reader_download_selector,
-        )
-    if host == RSC_PUBLIC_HOST or host.endswith(
-        "-rsc-org.proxy.lib.ohio-state.edu"
-    ):
-        return PublisherClickRule(
-            publisher="RSC",
-            pdf_selector=(
-                'a.article-pdfLink[href*="/article-pdf/"], '
-                'a[data-doctype="contentPdf"][href*="/article-pdf/"]'
-            ),
-            # DOI fallbacks resolve in Chrome to the public RSC article URL,
-            # which may omit the PDF control. Reopen that exact route through
-            # EZproxy so its authenticated toolbar can be clicked.
-            public_host=RSC_PUBLIC_HOST,
-            proxy_host=RSC_PROXY_HOST,
-            # Retain a generous fallback for old/non-article RSC DOIs that
-            # cannot use the deterministic article-landing URL above.
-            click_timeout_seconds=90,
-        )
-    if is_tandfonline_host(host):
-        return PublisherClickRule(
-            publisher="Taylor & Francis",
-            pdf_selector=(
-                'a.show-pdf[href*="/doi/epdf/"], '
-                'a[role="button"][href*="/doi/epdf/"]'
-            ),
-            download_selector=(
-                'a.download[data-download-files-key="pdf"][href*="/doi/pdf/"], '
-                'a[data-single-download="true"][href*="/doi/pdf/"]'
-            ),
-            reveal_download_selector=(
-                'button#new-download-btn[aria-label="Download"], '
-                'button[aria-label="Download"][aria-haspopup="true"]'
-            ),
-        )
-    if host == "academic.oup.com" or host.endswith(
-        "-oup-com.proxy.lib.ohio-state.edu"
-    ):
-        return PublisherClickRule(
-            publisher="Oxford Academic",
-            pdf_selector=(
-                'li.item-pdf a.article-pdfLink[href*="/advance-article-pdf/"], '
-                'a.article-pdfLink[href*="/advance-article-pdf/"], '
-                'li.item-pdf a.article-pdfLink[href*="/article-pdf/"], '
-                'a.article-pdfLink[href*="/article-pdf/"]'
-            ),
         )
     if host == IOP_PUBLIC_HOST or host.endswith(
         "-iop-org.proxy.lib.ohio-state.edu"
@@ -1985,40 +2417,6 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
                 'a[href*="/article/"][href*="/pdf/"]'
             ),
         )
-    if is_public_or_osu_proxy_host(host, "acpjournals.org"):
-        return PublisherClickRule(
-            publisher="ACP Journals",
-            pdf_selector=(
-                'div.info-panel__formats a.btn--pdf'
-                '[href*="/doi/reader/"], '
-                'a.btn--pdf[aria-label="Open full-text in eReader"]'
-                '[href*="/doi/reader/"]'
-            ),
-            download_selector=(
-                'a.navbar-download[data-single-download="true"]'
-                '[data-download-files-key="pdf"][href*="/doi/pdf/"], '
-                'a[aria-label^="Download PDF"]'
-                '[href*="/doi/pdf/"][href*="download=true"]'
-            ),
-        )
-    if is_public_or_osu_proxy_host(host, "aacrjournals.org"):
-        return PublisherClickRule(
-            publisher="AACR Journals",
-            pdf_selector=(
-                'a.article-pdfLink[data-doctype="contentPdf"]'
-                '[href*="/article-pdf/"], '
-                'a.article-pdfLink[href*="/article-pdf/"]'
-            ),
-        )
-    if is_public_or_osu_proxy_host(host, "jamanetwork.com"):
-        return PublisherClickRule(
-            publisher="JAMA Network",
-            pdf_selector=(
-                'a#pdf-link.js-pdfaccess[data-article-url$=".pdf"], '
-                'a.js-pdfaccess[aria-label="Download PDF"]'
-                '[data-article-url$=".pdf"]'
-            ),
-        )
     if (
         is_public_or_osu_proxy_host(host, "oce.ovid.com")
         or is_public_or_osu_proxy_host(host, "www.ovid.com")
@@ -2034,15 +2432,6 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
                 'button.omni-article-tool__check-access'
             ),
         )
-    if is_public_or_osu_proxy_host(host, "auajournals.org"):
-        return PublisherClickRule(
-            publisher="AUA Journals",
-            pdf_selector=(
-                'a.main-link[aria-label="PDF"][href*="/doi/epdf/"], '
-                'a[aria-label="PDF"][href*="/doi/epdf/"], '
-                'a[href*="/doi/epdf/"]'
-            ),
-        )
     if is_public_or_osu_proxy_host(host, "nature.com"):
         return PublisherClickRule(
             publisher="Nature",
@@ -2052,14 +2441,8 @@ def publisher_pdf_click_rule(url: str) -> PublisherClickRule | None:
                 'a.c-pdf-download__link[href$=".pdf"], '
                 'a[href*="/articles/"][href$=".pdf"]'
             ),
-        )
-    if is_public_or_osu_proxy_host(host, "haematologica.org"):
-        return PublisherClickRule(
-            publisher="Haematologica",
-            pdf_selector=(
-                'a.galley-link.obj_galley_link.pdf[href*="/article/view/"], '
-                'a.obj_galley_link.pdf[href*="/article/view/"]'
-            ),
+            public_host=NATURE_PUBLIC_HOST,
+            proxy_host=NATURE_PROXY_HOST,
         )
     if is_public_or_osu_proxy_host(host, "e-crt.org"):
         return PublisherClickRule(
@@ -2102,16 +2485,7 @@ def generic_osu_proxy_url(url: str) -> str:
         or publisher_pdf_click_rule(url) is not None
     ):
         return url
-    direct_pdf_patterns = (
-        "/article-pdf/",
-        "/content/pdf/",
-        "/doi/pdf/",
-        "/pdf/",
-        "/pdfft/",
-    )
-    if path.endswith(".pdf") or any(
-        pattern in path for pattern in direct_pdf_patterns
-    ):
+    if is_direct_pdf_path(path):
         return url
     proxy_host = f"{host.replace('.', '-')}.proxy.lib.ohio-state.edu"
     return parsed._replace(netloc=proxy_host).geturl()
@@ -2151,16 +2525,7 @@ def download_strategy(url: str) -> DownloadStrategy:
             label=click_rule.publisher,
         )
 
-    direct_pdf_patterns = (
-        "/article-pdf/",
-        "/content/pdf/",
-        "/doi/pdf/",
-        "/pdf/",
-        "/pdfft/",
-    )
-    if path.endswith(".pdf") or any(
-        pattern in path for pattern in direct_pdf_patterns
-    ):
+    if is_direct_pdf_path(path):
         return DownloadStrategy(
             priority=DIRECT_PDF_PRIORITY,
             automatic=True,
@@ -2176,24 +2541,25 @@ def download_strategy(url: str) -> DownloadStrategy:
 
 def open_publisher_and_click_pdf(
     url: str,
-    publisher: str,
-    selector: str,
-    download_selector: str | None,
-    reveal_download_selector: str | None,
-    dismiss_selector: str | None = None,
-    request_error_selector: str | None = None,
-    request_error_text: str | None = None,
-    download_unavailable_selector: str | None = None,
-    download_unavailable_texts: tuple[str, ...] = (),
-    direct_navigation: bool = False,
-    download_unavailable_statuses: tuple[int, ...] = (),
-    download_ready_selector: str | None = None,
-    public_host: str | None = None,
-    proxy_host: str | None = None,
-    proxy_path_replacements: tuple[tuple[str, str], ...] = (),
-    configured_click_timeout_seconds: int | None = None,
+    rule: PublisherClickRule,
 ) -> PublisherOpenResult:
     """Open a publisher article and click through to its final PDF download."""
+    publisher = rule.publisher
+    selector = rule.pdf_selector
+    download_selector = rule.download_selector
+    reveal_download_selector = rule.reveal_download_selector
+    dismiss_selector = rule.dismiss_selector
+    request_error_selector = rule.request_error_selector
+    request_error_text = rule.request_error_text
+    download_unavailable_selector = rule.download_unavailable_selector
+    download_unavailable_texts = rule.download_unavailable_texts
+    direct_navigation = rule.direct_navigation
+    download_unavailable_statuses = rule.download_unavailable_statuses
+    download_ready_selector = rule.download_ready_selector
+    public_host = rule.public_host
+    proxy_host = rule.proxy_host
+    proxy_path_replacements = rule.proxy_path_replacements
+
     if sys.platform != "darwin" or not shutil.which("osascript"):
         return PublisherOpenResult(
             PublisherOpenStatus.AUTOMATION_FAILED,
@@ -2202,7 +2568,7 @@ def open_publisher_and_click_pdf(
 
     # A proxy handoff performs one additional top-level page load. Give that
     # route its own small allowance without slowing ordinary publisher rules.
-    click_timeout_seconds = configured_click_timeout_seconds or (
+    click_timeout_seconds = rule.click_timeout_seconds or (
         PUBLISHER_CLICK_TIMEOUT_SECONDS + (10 if public_host and proxy_host else 0)
     )
     attempts = max(1, int(click_timeout_seconds / 0.5))
@@ -2282,6 +2648,9 @@ def open_publisher_and_click_pdf(
 
   if (directNavigation) {
     if (document.readyState !== 'complete') return 'waiting';
+    if (downloadReadySelector && !document.querySelector(downloadReadySelector)) {
+      return 'waiting';
+    }
     window.__automatedAccessCheckReadyAt ??= Date.now();
     const accessCheckSettled =
       Date.now() - window.__automatedAccessCheckReadyAt >= 4000;
@@ -2309,6 +2678,11 @@ def open_publisher_and_click_pdf(
       downloadReadyElement?.value
     );
     if (downloadLink && downloadIsReady) {
+      const embeddedPdfFrame = downloadLink.matches('iframe[src*=".pdf"]');
+      if (embeddedPdfFrame) {
+        downloadLink.focus();
+        return 'trusted_embedded_pdf_ready';
+      }
       const trustedOpenButton = downloadLink.querySelector('button#open-button');
       if (trustedOpenButton) {
         trustedOpenButton.focus();
@@ -2430,6 +2804,12 @@ on run argv
                     delay 0.2
                     tell application "System Events" to key code 36
                     if proxyNavigationStarted then return "download_clicked_after_proxy"
+                    return "download_clicked"
+                end if
+                if clickResult is "trusted_embedded_pdf_ready" then
+                    activate
+                    delay 0.5
+                    tell application "System Events" to key code 36
                     return "download_clicked"
                 end if
                 if clickResult is "trusted_pdf_button_ready" then
@@ -2616,44 +2996,18 @@ def open_url(url: str) -> PublisherOpenResult:
         strategy = download_strategy(url)
         click_rule = publisher_pdf_click_rule(url)
         if click_rule and (strategy.automatic or click_rule.direct_navigation):
-            open_status = open_publisher_and_click_pdf(
-                url=url,
-                publisher=click_rule.publisher,
-                selector=click_rule.pdf_selector,
-                download_selector=click_rule.download_selector,
-                reveal_download_selector=click_rule.reveal_download_selector,
-                dismiss_selector=click_rule.dismiss_selector,
-                request_error_selector=click_rule.request_error_selector,
-                request_error_text=click_rule.request_error_text,
-                download_unavailable_selector=(
-                    click_rule.download_unavailable_selector
-                ),
-                download_unavailable_texts=click_rule.download_unavailable_texts,
-                direct_navigation=click_rule.direct_navigation,
-                download_unavailable_statuses=(
-                    click_rule.download_unavailable_statuses
-                ),
-                download_ready_selector=click_rule.download_ready_selector,
-                public_host=click_rule.public_host,
-                proxy_host=click_rule.proxy_host,
-                proxy_path_replacements=click_rule.proxy_path_replacements,
-                configured_click_timeout_seconds=(
-                    click_rule.click_timeout_seconds
-                ),
-            )
+            open_status = open_publisher_and_click_pdf(url, click_rule)
             if open_status.status is not PublisherOpenStatus.AUTOMATION_FAILED:
                 return open_status
         elif sys.platform == "darwin" and shutil.which("osascript"):
             publisher = publisher_name_for_url(url)
-            inspection_status = open_publisher_and_click_pdf(
-                url=url,
+            inspection_rule = PublisherClickRule(
                 publisher=publisher,
-                selector='meta[name="__browser_pdf_no_click__"]',
-                download_selector=None,
-                reveal_download_selector=None,
+                pdf_selector='meta[name="__browser_pdf_no_click__"]',
                 direct_navigation=True,
-                configured_click_timeout_seconds=8,
+                click_timeout_seconds=8,
             )
+            inspection_status = open_publisher_and_click_pdf(url, inspection_rule)
             if inspection_status.status is PublisherOpenStatus.AUTOMATION_FAILED:
                 # The AppleScript creates the tab before inspecting it. Do not
                 # open a duplicate merely because that tab disallows JavaScript.
@@ -2793,13 +3147,103 @@ def write_result(
     )
 
 
+def prepare_download_url(existing_url: str, doi: str) -> PreparedDownloadUrl:
+    """Choose and describe a queue URL without performing network I/O."""
+    existing_url = normalize_cell(existing_url)
+    doi = normalize_doi(doi)
+    override_url = institutional_url_override(doi)
+    if override_url:
+        notice = f"  [OVERRIDE] doi={doi} -> {override_url}"
+        return PreparedDownloadUrl(
+            url=override_url,
+            action="override",
+            description="institutional override",
+            notice=notice if override_url != existing_url else "",
+        )
+
+    repaired_existing_url = existing_url
+    if is_http_url(existing_url):
+        repaired_existing_url = generic_osu_proxy_url(
+            rewrite_resolved_url(existing_url, fallback_doi=doi)
+        )
+
+    if OVERRIDE_EXISTING_DOWNLOAD_URLS:
+        if repaired_existing_url != existing_url:
+            return PreparedDownloadUrl(
+                url=repaired_existing_url,
+                action="repaired",
+                description="refresh existing URL" if existing_url else "resolve DOI",
+                notice=f"  [REPAIR URL] {existing_url} -> {repaired_existing_url}",
+            )
+        refreshed_url = prepare_pdf_url_locally(doi)
+        action = (
+            "lazy_doi_resolution"
+            if is_doi_resolver_url(refreshed_url)
+            else "refreshed_locally"
+        )
+        notice = (
+            f"  [REFRESH URL] {existing_url} -> {refreshed_url}"
+            if existing_url and refreshed_url != existing_url
+            else ""
+        )
+        return PreparedDownloadUrl(
+            url=refreshed_url,
+            action=action,
+            description="refresh existing URL" if existing_url else "resolve DOI",
+            notice=notice,
+        )
+
+    local_url = prepare_pdf_url_locally(doi)
+    is_aip_repair = doi.casefold().startswith("10.1063/")
+    is_rsc_repair = (urlparse(local_url).hostname or "") == RSC_PROXY_HOST
+    if is_doi_resolver_url(existing_url) and (is_aip_repair or is_rsc_repair):
+        publisher = "AIP" if is_aip_repair else "RSC"
+        return PreparedDownloadUrl(
+            url=local_url,
+            action="repaired",
+            description=f"repair {publisher} DOI URL",
+            notice=f"  [REPAIR URL] {existing_url} -> {local_url}",
+        )
+
+    if repaired_existing_url != existing_url:
+        return PreparedDownloadUrl(
+            url=repaired_existing_url,
+            action="repaired",
+            description="repair existing URL",
+            notice=f"  [REPAIR URL] {existing_url} -> {repaired_existing_url}",
+        )
+    if is_http_url(existing_url):
+        return PreparedDownloadUrl(
+            url=existing_url,
+            action="reused",
+            description="reuse existing URL",
+        )
+
+    return PreparedDownloadUrl(
+        url=local_url,
+        action=(
+            "lazy_doi_resolution"
+            if is_doi_resolver_url(local_url)
+            else "prepared_locally"
+        ),
+        description="resolve DOI",
+    )
+
+
 def build_queue(
-    rows: list[dict[str, str]], *, require_target_flag: bool
+    rows: list[dict[str, str]],
+    *,
+    require_target_flag: bool,
+    target_doi: str = "",
 ) -> list[dict[str, str]]:
     eligible: list[tuple[dict[str, str], str, str]] = []
     seen_pmids: set[str] = set()
+    normalized_target_doi = normalize_doi(target_doi).casefold()
 
     for row in rows:
+        row_doi = normalize_doi(row.get(DOI_COLUMN))
+        if normalized_target_doi and row_doi.casefold() != normalized_target_doi:
+            continue
         if require_target_flag and not is_yes(row.get(IS_FETCH_TARGET_COLUMN)):
             continue
 
@@ -2894,7 +3338,7 @@ def build_queue(
             )
             continue
 
-        doi = normalize_doi(row.get(DOI_COLUMN))
+        doi = row_doi
         if not doi:
             continue
         if not is_http_url(doi) and not doi.casefold().startswith("10."):
@@ -2925,11 +3369,16 @@ def build_queue(
 
         eligible.append((row, pmid, doi))
 
-    selected = eligible[BATCH_START:BATCH_START + BATCH_LIMIT]
+    selected = (
+        eligible
+        if normalized_target_doi
+        else eligible[BATCH_START:BATCH_START + BATCH_LIMIT]
+    )
     selected_count = len(selected)
     print(
         f"[URL PREP] selected={selected_count} eligible={len(eligible)} "
         f"start={BATCH_START} limit={BATCH_LIMIT} "
+        f"doi_filter={normalize_doi(target_doi) or 'none'} "
         f"override_existing={OVERRIDE_EXISTING_DOWNLOAD_URLS} local_only=True"
     )
 
@@ -2938,91 +3387,15 @@ def build_queue(
     blocked_count = 0
     for index, (row, pmid, doi) in enumerate(selected, start=1):
         existing_url = normalize_cell(row.get(DOWNLOAD_URL_COLUMN))
-        override_url = institutional_url_override(doi)
-        rsc_url = rsc_proxy_article_url(doi)
-        aip_proxy_url = (
-            prepare_pdf_url_locally(doi)
-            if normalize_doi(doi).casefold().startswith("10.1063/")
-            else ""
-        )
-        repaired_existing_url = (
-            generic_osu_proxy_url(
-                rewrite_resolved_url(existing_url, fallback_doi=doi)
-            )
-            if is_http_url(existing_url)
-            else existing_url
-        )
-        if override_url:
-            planned_action = "institutional override"
-        elif OVERRIDE_EXISTING_DOWNLOAD_URLS and existing_url:
-            planned_action = "refresh existing URL"
-        elif OVERRIDE_EXISTING_DOWNLOAD_URLS:
-            planned_action = "resolve DOI"
-        elif is_doi_resolver_url(existing_url) and aip_proxy_url:
-            planned_action = "repair AIP DOI URL"
-        elif is_doi_resolver_url(existing_url) and rsc_url:
-            planned_action = "repair RSC DOI URL"
-        elif repaired_existing_url != existing_url:
-            planned_action = "repair existing URL"
-        elif is_http_url(existing_url):
-            planned_action = "reuse existing URL"
-        else:
-            planned_action = "resolve DOI"
+        prepared = prepare_download_url(existing_url, doi)
         print(
-            f"[URL {index}/{selected_count}] pmid {pmid} | {planned_action}"
+            f"[URL {index}/{selected_count}] pmid {pmid} | "
+            f"{prepared.description}"
         )
-
-        if override_url:
-            url = override_url
-            action = "override"
-            if url != existing_url:
-                print(f"  [OVERRIDE] doi={doi} -> {url}")
-        elif OVERRIDE_EXISTING_DOWNLOAD_URLS:
-            repaired_url = (
-                generic_osu_proxy_url(
-                    rewrite_resolved_url(existing_url, fallback_doi=doi)
-                )
-                if is_http_url(existing_url)
-                else existing_url
-            )
-            if repaired_url != existing_url:
-                url = repaired_url
-                action = "repaired"
-                print(f"  [REPAIR URL] {existing_url} -> {url}")
-            else:
-                refreshed_url = prepare_pdf_url_locally(doi)
-                url = refreshed_url
-                action = (
-                    "lazy_doi_resolution"
-                    if is_doi_resolver_url(url)
-                    else "refreshed_locally"
-                )
-                if existing_url and url != existing_url:
-                    print(f"  [REFRESH URL] {existing_url} -> {url}")
-        elif is_doi_resolver_url(existing_url) and aip_proxy_url:
-            url = aip_proxy_url
-            action = "repaired"
-            print(f"  [REPAIR URL] {existing_url} -> {url}")
-        elif is_doi_resolver_url(existing_url) and rsc_url:
-            url = rsc_url
-            action = "repaired"
-            print(f"  [REPAIR URL] {existing_url} -> {url}")
-        elif repaired_existing_url != existing_url:
-            url = repaired_existing_url
-            action = "repaired"
-            print(f"  [REPAIR URL] {existing_url} -> {url}")
-        elif is_http_url(existing_url):
-            url = existing_url
-            action = "reused"
-        else:
-            url = prepare_pdf_url_locally(doi)
-            action = (
-                "lazy_doi_resolution"
-                if is_doi_resolver_url(url)
-                else "prepared_locally"
-            )
-
-        action_counts[action] = action_counts.get(action, 0) + 1
+        if prepared.notice:
+            print(prepared.notice)
+        url = prepared.url
+        action_counts[prepared.action] = action_counts.get(prepared.action, 0) + 1
 
         blocked_pattern = matching_blocked_pattern(url)
         if blocked_pattern:
@@ -3075,7 +3448,24 @@ def build_queue(
     return queue
 
 
-def main() -> int:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Download article PDFs listed in the configured input CSV."
+    )
+    parser.add_argument(
+        "--doi",
+        default="",
+        help="run only the CSV record matching this DOI",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    target_doi = normalize_doi(args.doi)
+    if args.doi and not target_doi.casefold().startswith("10."):
+        print(f"Invalid --doi value: {args.doi!r}")
+        return 2
     if BATCH_START < 0 or BATCH_LIMIT <= 0:
         print("BATCH_START must be >= 0 and BATCH_LIMIT must be > 0")
         return 1
@@ -3143,7 +3533,11 @@ def main() -> int:
         fieldnames,
         [*DOWNLOAD_RESULT_FIELDS, IS_FETCH_TARGET_COLUMN, DOI_COLUMN],
     )
-    queue = build_queue(rows, require_target_flag=require_target_flag)
+    queue = build_queue(
+        rows,
+        require_target_flag=require_target_flag and not target_doi,
+        target_doi=target_doi,
+    )
 
     # Persist validation, existing-file, skip-rule, and pending states even when
     # there are no automatic browser targets.
@@ -3154,6 +3548,8 @@ def main() -> int:
         print("No valid browser targets in this batch.")
         return 0
 
+    if target_doi:
+        print(f"[DOI FILTER] {target_doi}")
     print(f"[BATCH] count={len(queue)} start={BATCH_START} limit={BATCH_LIMIT}")
     automatic_count = sum(
         download_strategy(normalize_cell(row.get(DOWNLOAD_URL_COLUMN))).automatic
@@ -3311,6 +3707,7 @@ def main() -> int:
 
         strategy = download_strategy(url)
         publisher = publisher_name_for_url(url)
+        automation_policy = publisher_automation_policy(publisher)
         row[FETCH_PUBLISHER_COLUMN] = publisher
         mode = "automatic" if strategy.automatic else "manual review"
         print(f"  [MODE] {mode}: {strategy.label}")
@@ -3389,23 +3786,28 @@ def main() -> int:
                 if open_status.status is not PublisherOpenStatus.REQUEST_BLOCKED:
                     break
 
-                if publisher == "Optica Publishing Group":
+                if automation_policy.max_rate_limit_deferrals > 0:
                     row_key = id(row)
                     deferral_count = rate_limit_deferrals.get(row_key, 0)
-                    if deferral_count < OPTICA_RATE_LIMIT_MAX_DEFERRALS:
+                    if (
+                        deferral_count
+                        < automation_policy.max_rate_limit_deferrals
+                    ):
                         deferral_count += 1
                         rate_limit_deferrals[row_key] = deferral_count
                         publisher_cooldown_until[publisher] = max(
                             publisher_cooldown_until.get(publisher, 0.0),
-                            time.monotonic() + OPTICA_COOLDOWN_SECONDS,
+                            time.monotonic() + automation_policy.cooldown_seconds,
                         )
                         queue.append(row)
                         rate_limit_deferred = True
                         print(
                             f"  [RATE LIMIT DEFER] {publisher} paused for "
-                            f"{OPTICA_COOLDOWN_SECONDS}s; article requeued "
+                            f"{automation_policy.cooldown_seconds}s; "
+                            "article requeued "
                             f"behind other publishers "
-                            f"({deferral_count}/{OPTICA_RATE_LIMIT_MAX_DEFERRALS})",
+                            f"({deferral_count}/"
+                            f"{automation_policy.max_rate_limit_deferrals})",
                             flush=True,
                         )
                         log_event(
@@ -3414,7 +3816,9 @@ def main() -> int:
                                 "publisher": publisher,
                                 "pmid": pmid,
                                 "url": url,
-                                "cooldown_seconds": OPTICA_COOLDOWN_SECONDS,
+                                "cooldown_seconds": (
+                                    automation_policy.cooldown_seconds
+                                ),
                                 "deferral_count": deferral_count,
                                 "detected_at": now_timestamp(),
                             }
@@ -3424,7 +3828,7 @@ def main() -> int:
 
                 if (
                     request_error_retries
-                    >= SCIENCEDIRECT_REQUEST_ERROR_MAX_RETRIES
+                    >= automation_policy.max_request_error_retries
                 ):
                     request_error_failure = (
                         "publisher_request_error_retries_exhausted"
@@ -3437,6 +3841,7 @@ def main() -> int:
                     pmid=pmid,
                     url=url,
                     retry_number=request_error_retries,
+                    policy=automation_policy,
                 ):
                     request_error_failure = (
                         "publisher_request_error_recovery_failed"
@@ -3775,18 +4180,17 @@ def main() -> int:
                     publisher_success_counts.get(publisher, 0) + 1
                 )
                 publisher_success_counts[publisher] = publisher_success_count
-                if (
-                    publisher == "Optica Publishing Group"
-                    and publisher_success_count % OPTICA_DOWNLOADS_PER_BURST == 0
-                ):
+                burst_size = automation_policy.downloads_per_burst
+                if burst_size and publisher_success_count % burst_size == 0:
                     publisher_cooldown_until[publisher] = max(
                         publisher_cooldown_until.get(publisher, 0.0),
-                        time.monotonic() + OPTICA_COOLDOWN_SECONDS,
+                        time.monotonic() + automation_policy.cooldown_seconds,
                     )
                     print(
                         f"  [SCHEDULED PUBLISHER PAUSE] {publisher} completed "
                         f"{publisher_success_count} downloads; deferring it for "
-                        f"{OPTICA_COOLDOWN_SECONDS}s while other publishers run",
+                        f"{automation_policy.cooldown_seconds}s while other "
+                        "publishers run",
                         flush=True,
                     )
                     log_event(
@@ -3794,16 +4198,13 @@ def main() -> int:
                             "event": "publisher_scheduled_cooldown",
                             "publisher": publisher,
                             "successful_downloads": publisher_success_count,
-                            "burst_size": OPTICA_DOWNLOADS_PER_BURST,
-                            "cooldown_seconds": OPTICA_COOLDOWN_SECONDS,
+                            "burst_size": burst_size,
+                            "cooldown_seconds": automation_policy.cooldown_seconds,
                             "started_at": now_timestamp(),
                         }
                     )
-                if (
-                    CLOSE_SCIENCEDIRECT_TABS_AT_BREAK
-                    and download_break_is_due(successful_downloads)
-                ):
-                    close_sciencedirect_tabs()
+                if download_break_is_due(successful_downloads):
+                    close_tabs_for_scheduled_break(url)
                 if publisher_uses_scheduled_cleanup(strategy.label):
                     publisher_successes = (
                         successful_cleanup_downloads_by_publisher.get(
